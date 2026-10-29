@@ -1,7 +1,7 @@
 {
-  "name": "hermes-office",
-  "version": "0.1.0.post1",
-  "description": "View and manage Bot Mode agents in a shared office in Hermes Desktop.",
+  "name": "pixel-office-worlds",
+  "version": "0.2.0",
+  "description": "Hermes Office with animated characters and switchable worlds for your Bot Mode agents in Hermes Desktop.",
   "updater": "none",
   "companions": []
 }

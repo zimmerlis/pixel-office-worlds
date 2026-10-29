@@ -135,9 +135,10 @@ test('roamMs is longer for a farther walk, and stays in range', () => {
 })
 
 test('plugin id matches the folder contract', () => {
-  assert.match(source, /const ID = 'hermes-office'/)
+  assert.match(source, /const ID = 'pixel-office-worlds'/)
   assert.match(source, /id: ID/)
-  assert.match(source, /path: '\/office'/)
+  assert.match(source, /const ROUTE = '\/pixel-office-worlds'/)
+  assert.match(source, /path: ROUTE/)
 })
 
 test('floor markup has a bar, hopscotch, and flat room skins', () => {

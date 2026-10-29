@@ -3,3 +3,10 @@ backdrops/
 tools/preview/node_modules/
 tools/preview/live.html
 tools/preview/live-bundle.js
+
+# Character worlds: only the public ones are tracked. The others stay local
+# (premium worlds for supporters) and are never committed.
+characters/*
+!characters/animals/
+!characters/bots/
+characters/**/_*/

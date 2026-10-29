@@ -1,6 +1,105 @@
-# Hermes Office
+# Pixel Office Worlds
 
-A small, increasingly peculiar office for your Hermes bots. One carpeted room, real tasks, a pizza counter, and a cat with no respect for the seating plan.
+**Your Hermes agents deserve a better office.** Pixel Office Worlds turns the Hermes Desktop office into a living, animated place: every agent gets its own character with 13 animated moods, and with one click the whole room switches to a different world, from a woodland office full of animals to a futuristic robot lab.
+
+![Pixel Office Worlds: six of the available worlds](assets/worlds-overview.png)
+
+Based on the wonderful [Hermes Office](https://github.com/Adolanium/hermes-office) by Adolanium. All of its office life (tasks, pizza, the boss, the cat, toy drawer scenes) is still here. Pixel Office Worlds adds:
+
+- **Animated characters.** Each agent is an animated GIF character that thinks while it reasons, peeks while it calls tools, cheers on success, sleeps at night, shies away when you grab it, and walks to the pizza counter.
+- **Switchable worlds.** Pick a world in the **World** menu. Walls, floor, desks and furniture change with it, and every agent takes on that world's character.
+- **Pick a character per agent.** In **Sprites** you choose a character set and colour for each agent. The choice is remembered.
+- **Three looks.** Switch between *icons*, *avatars* and *sprites*.
+- **Logbook.** The office keeps a log of the last 200 finished tasks and shows agents working in background sessions.
+- **Make your own world.** A world is just a folder with GIFs, SVGs and two small JSON files. Drop it into `characters/`, press **Reload**, done. No code changes.
+
+## Free worlds
+
+These two worlds ship with the plugin.
+
+### Animal Crew · Woodland Office
+
+A retriever, a lion manager, a raccoon coder, an owl analyst, a beaver sysadmin, a chameleon webmaster and a meerkat in quality assurance.
+
+![Animal Crew world](assets/screenshots/animals.png)
+
+### Bots · Futuristic Lab
+
+Seven little robots in a glowing night-shift lab.
+
+![Bots world](assets/screenshots/bots.png)
+
+## More worlds for supporters ☕
+
+There are more worlds, each fully animated with seven characters and its own room:
+
+| | |
+|---|---|
+| ![Building Bricks](assets/screenshots/lego.png) **Building Bricks** | ![Starship Deck](assets/screenshots/starwars.png) **Starship Deck** |
+| ![Mushroom Kingdom Office](assets/screenshots/supermario.png) **Mushroom Kingdom Office** | ![Block Office](assets/screenshots/minecraft.png) **Block Office** |
+| ![Sector 7G](assets/screenshots/simpsons.png) **Sector 7G** *(in progress)* | ![Starfleet Bridge](assets/screenshots/startrek.png) **Starfleet Bridge** *(in progress)* |
+
+**Want them?** [Buy me a coffee](https://buymeacoffee.com/oxekklfcg) with **USD 15 or more** and leave your e-mail address in the message. You'll get the world packs sent to you, including the worlds still in progress once they're finished. Unzip a pack into `characters/` and press **Reload** in the World menu.
+
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95%20support%20this%20plugin-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/oxekklfcg)
+
+## Install
+
+You need Hermes Desktop and Git.
+
+```powershell
+cd $env:LOCALAPPDATA\hermes\desktop-plugins
+git clone https://github.com/zimmerlis/pixel-office-worlds
+```
+
+Then press Ctrl+K in Hermes and choose **Reload desktop plugins**. Open **Pixel Office Worlds** in the sidebar, open **Sprites** and switch the mode to *sprites*, then pick a world under **World**.
+
+Pixel Office Worlds runs next to the original *Hermes Office*: it has its own plugin ID (`pixel-office-worlds`), its own page and its own settings, so you can keep both installed.
+
+To update later:
+
+```powershell
+cd $env:LOCALAPPDATA\hermes\desktop-plugins\pixel-office-worlds
+git pull
+```
+
+Supporter worlds live in `characters/` too, but Git ignores them, so `git pull` never touches them.
+
+## Build your own world
+
+See [characters-readme.md](characters-readme.md) for the full format. In short:
+
+```
+characters/
+  my-world/
+    sprites.json          name, colours, mood aliases
+    blue_idle.gif         <colour>_<mood>.gif, one per colour and mood
+    blue_think.gif
+    …
+    world/
+      world.json          wall, floor, desk and props of the room
+      wall.svg  floor.svg  desk.svg  props/…
+```
+
+Moods: `idle`, `think`, `peek`, `held`, `failed`, `sleep`, `pet`, `clap`, `stretch`, `shy`, `bored`, `walkfront`, `walkback`. Every mood is optional; missing ones fall back to `idle`. GIFs of 256×256 px are plenty.
+
+## Screenshots
+
+The pictures in this README are made with the real plugin:
+
+```powershell
+npm install --prefix tools/preview
+node tools/screenshots/capture.mjs            # every world in characters/
+node tools/screenshots/capture.mjs animals    # just one
+```
+
+They land in `assets/screenshots/`. You need Chrome or Edge (or set `CHROME` to a browser path).
+
+---
+
+# Everything the office does
+
+The rest of this page describes the office itself, as built by Hermes Office.
 
 ## Work at the desks
 
@@ -50,21 +149,7 @@ The **Office newspaper** opens *The Carpet Chronicle*, with the weekly task, piz
 
 The office also keeps the original petting, dragging, blinking, sleeping, hopscotch, musical chairs, hourly breaks, day/night window, warm desk lamps, and employee-of-the-month portrait. Tap a bot to pet it; hold it still to let it sleep. With a bot selected, arrows nudge it, Shift makes larger steps, Enter opens its chat, and P pets it. **Back to desk** sends a wandering bot home.
 
-Reduced-motion settings disable decorative bouncing, spinning, and incident animations. Task controls remain separate from the scene controls. Large rosters scroll inside the room, with furniture below the desks. Older saved background selections migrate to the carpet office; other room themes are no longer offered.
-
-## Install
-
-Copy this folder to the machine running Hermes Desktop:
-
-```text
-%USERPROFILE%\AppData\Local\hermes\desktop-plugins\hermes-office
-```
-
-The folder must be named `hermes-office`. Press Ctrl+K, then **Reload desktop plugins**. Open **Office** in the sidebar or use **Open office floor** in the command palette.
-
-Use a Desktop build with owner-routed `host.requestProfile`, `host.onEvent`, and `host.openSession`. Office fails closed when it cannot establish who owns a background request. Bot Mode does not need to be on, but its saved names and avatars are reused.
-
-The installed plugin remains a single `plugin.js` file with the SDK and React supplied by Hermes. The npm packages below are only for local preview development.
+Reduced-motion settings disable decorative bouncing, spinning, and incident animations. Task controls remain separate from the scene controls. Large rosters scroll inside the room, with furniture below the desks. In sprites mode, the room follows the chosen world.
 
 ## Preview and tests
 
@@ -74,47 +159,16 @@ node tools/preview/build.mjs
 node tools/preview/serve.mjs
 ```
 
-Open [the interactive preview](http://localhost:4877/preview.html). It renders the actual plugin with a local SDK stand-in and simulated six-second tasks. Its storage is isolated from Hermes. It also has a light/dark toggle.
+Open [the interactive preview](http://localhost:4877/preview.html). It renders the actual plugin with a local SDK stand-in and simulated six-second tasks. Its storage is isolated from Hermes.
 
 ```powershell
 node --test tests/*.test.mjs
 ```
 
-Tests cover task routing and lifecycle, room migration, pizza ownership, animation math, scene casting and cancellation, bounded memories, personality persistence, and input-request correlation.
-
-## License
-
-MIT
-
-
 ## Catalog package
 
-The `catalog/` directory packages this Desktop plugin for the Hermes plugin catalog,
-using the [combined package layout](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks).
-Catalog admission is pending. The repository does not imply approval or endorsement.
+The `catalog/` directory is the Hermes catalog package inherited from Hermes Office. It contains only `plugin.js`, so it shows the office without any character worlds. Use the Git install above to get the worlds. After changing the root `plugin.js`, run `python scripts/build_catalog.py` and commit the `catalog/` files; CI checks that they are current.
 
-To install the package directly before catalog admission:
+## Credits and license
 
-```sh
-hermes plugins install Adolanium/hermes-office/catalog
-```
-
-Restart Hermes Desktop or rescan plugins, then enable the Desktop component in
-Capabilities > Plugins. This package adds no Agent tools, hooks, or middleware.
-It requires Hermes Desktop with combined-package support. On a remote backend,
-the Desktop component must also be installed on the machine running the app.
-
-The existing root `plugin.js` remains the standalone distribution. Keep one
-installation per Desktop plugin. Before switching from a manual install, back up
-and move its folder out of the Desktop plugin directory; Hermes intentionally
-does not overwrite manual installations. Keep plugin settings when migrating.
-
-After catalog admission, use `hermes plugins update hermes-office` and rescan
-Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
-actions cannot replace its files from GitHub releases. Standalone signed updates
-continue to use the existing root files.
-
-For development, edit the root files, then run `python scripts/build_catalog.py`.
-Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
-to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.1.0-1` and are not marked as the latest standalone release.
+Office, scenes and catalog packaging: [Hermes Office](https://github.com/Adolanium/hermes-office) by Adolanium. Worlds, animated characters and the world system: René Zimmerli. MIT licensed, see [LICENSE](LICENSE).

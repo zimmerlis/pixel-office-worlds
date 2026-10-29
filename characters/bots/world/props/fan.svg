@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 42 42">
+  <ellipse cx="21" cy="38" rx="13" ry="3" fill="#1f3556"/>
+  <rect x="17" y="26" width="8" height="12" fill="#25405f"/>
+  <circle cx="21" cy="15" r="13" fill="#0d1a2e" stroke="#38e8ff" stroke-width="2"/>
+  <g stroke="#7ff3ff" stroke-width="3" stroke-linecap="round">
+    <path d="M21 15V5M21 15l8.7 5M21 15l-8.7 5">
+      <animateTransform attributeName="transform" type="rotate" from="0 21 15" to="360 21 15" dur="1.6s" repeatCount="indefinite"/>
+    </path>
+  </g>
+  <circle cx="21" cy="15" r="2.5" fill="#38e8ff"/>
+</svg>

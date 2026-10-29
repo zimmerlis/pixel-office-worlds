@@ -1,0 +1,24 @@
+{
+  "name": "Futuristic lab",
+  "wall": "wall.svg",
+  "wallSize": "160px 86px",
+  "wallColor": "#0f1b2d",
+  "floor": "floor.svg",
+  "floorSize": "96px 96px",
+  "floorColor": "#0b1220",
+  "desk": "desk.svg",
+  "props": {
+    "coffee": "props/coffee.svg",
+    "fan": "props/fan.svg",
+    "chair": "props/chair.svg",
+    "bin": "props/bin.svg",
+    "cat": "props/cat.svg",
+    "certificate": "props/certificate.svg",
+    "aquarium": "props/aquarium.svg",
+    "button": "props/button.svg",
+    "pizza-box": "props/pizza-box.svg",
+    "mug": "props/mug.svg",
+    "parcel": "props/parcel.svg",
+    "cooler": "props/cooler.svg"
+  }
+}
