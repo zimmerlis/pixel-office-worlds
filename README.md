@@ -1,8 +1,10 @@
 # Pixel Office Worlds
 
 <p align="center">
-  <img src="characters/animals/blue_idle.gif" width="220" alt="The lion manager from the Animal Crew world, idling">
-  <img src="characters/bots/cyan_idle.gif" width="220" alt="A robot from the Bots world, idling">
+  <img src="characters/animals/blue_idle.gif" width="180" alt="The lion manager from the Animal Crew world, idling">
+  <img src="characters/bots/cyan_idle.gif" width="180" alt="A robot from the Bots world, idling">
+  <img src="characters/animals/pink_sleep.gif" width="180" alt="The meerkat from the Animal Crew world, asleep">
+  <img src="characters/bots/green_success.gif" width="180" alt="A green robot from the Bots world, cheering">
 </p>
 
 **Your Hermes agents deserve a better office.** Pixel Office Worlds turns the Hermes Desktop office into a living, animated place: every agent gets its own character with 13 animated moods, and with one click the whole room switches to a different world, from a woodland office full of animals to a futuristic robot lab.
