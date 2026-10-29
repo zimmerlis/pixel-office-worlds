@@ -92,16 +92,6 @@ characters/
 
 Moods: `idle`, `think`, `peek`, `held`, `failed`, `sleep`, `pet`, `clap`, `stretch`, `shy`, `bored`, `walkfront`, `walkback`. Every mood is optional; missing ones fall back to `idle`. GIFs of 256×256 px are plenty.
 
-## Keeping local worlds out of Git
-
-Only the worlds listed in [public-worlds.txt](public-worlds.txt) are published. `.gitignore` hides every other folder in `characters/`, and two Git hooks block any commit or push that contains one anyway (for example after `git add -f`). Turn the hooks on once per clone:
-
-```powershell
-git config core.hooksPath scripts/hooks
-```
-
-To publish a world on purpose, add its folder name to `public-worlds.txt` and a `!characters/<name>/` line to `.gitignore`.
-
 ## Screenshots
 
 The pictures in this README are made with the real plugin:
