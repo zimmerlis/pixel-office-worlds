@@ -41,6 +41,8 @@ There are more worlds, each fully animated with seven characters and its own roo
 
 **Want them?** [Buy me a coffee](https://buymeacoffee.com/oxekklfcg) with **USD 15 or more** and leave your e-mail address in the message. You'll get the world packs sent to you, including the worlds still in progress once they're finished. Unzip a pack into `characters/` and press **Reload** in the World menu.
 
+**Have an idea for a new world?** [Buy me a coffee](https://buymeacoffee.com/oxekklfcg) with **USD 50 or more** and describe your idea in the message. I'll create your new world for you.
+
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95%20support%20this%20plugin-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/oxekklfcg)
 
 ## Install
@@ -82,6 +84,16 @@ characters/
 ```
 
 Moods: `idle`, `think`, `peek`, `held`, `failed`, `sleep`, `pet`, `clap`, `stretch`, `shy`, `bored`, `walkfront`, `walkback`. Every mood is optional; missing ones fall back to `idle`. GIFs of 256×256 px are plenty.
+
+## Keeping local worlds out of Git
+
+Only the worlds listed in [public-worlds.txt](public-worlds.txt) are published. `.gitignore` hides every other folder in `characters/`, and two Git hooks block any commit or push that contains one anyway (for example after `git add -f`). Turn the hooks on once per clone:
+
+```powershell
+git config core.hooksPath scripts/hooks
+```
+
+To publish a world on purpose, add its folder name to `public-worlds.txt` and a `!characters/<name>/` line to `.gitignore`.
 
 ## Screenshots
 

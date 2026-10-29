@@ -1,0 +1,6 @@
+# Character worlds that may be committed and published (folder names in characters/).
+# Every other world stays local. The Git hooks in scripts/hooks block any commit
+# or push that contains a world not listed here.
+# To publish a world: add its name here AND a matching "!characters/<name>/" line in .gitignore.
+animals
+bots

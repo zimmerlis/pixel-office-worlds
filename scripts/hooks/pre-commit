@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stops a commit that adds or changes files of a non-public character world.
+git diff --cached --name-only --diff-filter=ACMR | sh "$(git rev-parse --show-toplevel)/scripts/hooks/check-worlds.sh"
