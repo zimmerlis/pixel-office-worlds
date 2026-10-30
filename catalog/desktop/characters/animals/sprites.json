@@ -1,0 +1,34 @@
+{
+  "_comment": "One character set. Put <color>_<mood>.gif files next to this file; every color found becomes selectable in the Sprites panel. 'colors' only adds a label and swatch (the agent's accent color) and may list explicit 'files' per mood. 'aliases' lists the file suffixes a mood accepts (first wins). 'fallback' lets a missing mood reuse another one. 'default' is used for moods a color has no file for. 'suggest' is only the initial color for agents that have no saved choice. Moods: idle, think, held, sleep, pet, clap, stretch, shy, peek, bored, failed, walkfront, walkback.",
+  "name": "Animal Crew",
+  "colors": {
+    "cyan":   { "label": "Retriever (Hermy)",     "swatch": "#06b6d4" },
+    "orange": { "label": "Beaver (Sysadmin)",     "swatch": "#f97316" },
+    "blue":   { "label": "Lion (Manager)",        "swatch": "#3b82f6" },
+    "yellow": { "label": "Owl (Analyst)",         "swatch": "#eab308" },
+    "purple": { "label": "Raccoon (Coder)",       "swatch": "#7c3aed" },
+    "green":  { "label": "Chameleon (Webmaster)", "swatch": "#10b981" },
+    "pink":   { "label": "Meerkat (Quality)",     "swatch": "#ec4899" }
+  },
+  "aliases": {
+    "think": ["think", "thinking"],
+    "peek": ["peek", "working"],
+    "clap": ["clap", "success"],
+    "pet": ["pet", "success"],
+    "held": ["held", "alert"],
+    "failed": ["failed", "alert"],
+    "walkfront": ["walkfront", "move_front"],
+    "walkback": ["walkback", "move_back"]
+  },
+  "fallback": { "shy": "think" },
+  "suggest": {
+    "default": "cyan",
+    "hermy": "cyan",
+    "sysadmin": "orange",
+    "manager": "blue",
+    "analyst": "yellow",
+    "coder": "purple",
+    "webmaster": "green",
+    "quality": "pink"
+  }
+}

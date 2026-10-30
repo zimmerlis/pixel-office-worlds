@@ -50,7 +50,20 @@ The **Office newspaper** opens *The Carpet Chronicle*, with the weekly task, piz
 
 The office also keeps the original petting, dragging, blinking, sleeping, hopscotch, musical chairs, hourly breaks, day/night window, warm desk lamps, and employee-of-the-month portrait. Tap a bot to pet it; hold it still to let it sleep. With a bot selected, arrows nudge it, Shift makes larger steps, Enter opens its chat, and P pets it. **Back to desk** sends a wandering bot home.
 
-Reduced-motion settings disable decorative bouncing, spinning, and incident animations. Task controls remain separate from the scene controls. Large rosters scroll inside the room, with furniture below the desks. Older saved background selections migrate to the carpet office; other room themes are no longer offered.
+Reduced-motion settings disable decorative bouncing, spinning, and incident animations. Task controls remain separate from the scene controls. Large rosters scroll inside the room, with furniture below the desks. Older saved background selections migrate to the carpet office; in sprites mode, the room follows the chosen world.
+
+## Characters and worlds
+
+**Sprites** switches the office between three looks: the plugin's own icons, the agents' Hermes avatars, or animated **sprite characters**. A character has up to 13 moods: it thinks while the agent reasons, peeks while it calls tools, cheers on success, sleeps at night, shies away when you grab it, and has its own walk cycles. In sprites mode you can choose a character set and colour for each bot; the choice is remembered.
+
+**World** changes the whole room: wall, floor, desks and furniture. Picking a world also switches every bot to that world's characters. Two worlds are included:
+
+- **Animal Crew** in a woodland office: a retriever, a lion manager, a raccoon coder, an owl analyst, a beaver sysadmin, a chameleon webmaster and a meerkat in quality assurance.
+- **Bots** in a futuristic lab: seven little robots, one per colour.
+
+A world is just a folder: drop it into `characters/` and press **Reload**, no code changes needed. [characters/README.md](characters/README.md) explains the format (file names, moods, `sprites.json`, the optional `world/` folder), and [world/README.md](world/README.md) lists every size in the room.
+
+**Logbook** keeps the last 200 finished tasks in the plugin's local storage: bot, time, outcome, duration, the tools used, and the first 300 characters of the task and the first 400 of its reply. Unlike the newspaper, it does store task text, so it can show what each bot did. The office also shows bots that are working in background sessions.
 
 ## Install
 

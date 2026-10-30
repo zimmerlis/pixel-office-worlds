@@ -58,9 +58,42 @@ def build(check=False):
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8", newline="\n")
+    stale += sync_assets(config.get("assets", []), check)
     if stale:
         raise SystemExit("Run python scripts/build_catalog.py; stale files: " + ", ".join(stale))
     print("Catalog package verified" if check else "Catalog package built")
+
+
+def sync_assets(folders, check=False):
+    """Copy asset folders (worlds, character sprites) byte for byte into catalog/desktop/.
+
+    Files and folders whose name starts with "_" or "." are skipped, like the
+    plugin's own loader does. Returns the stale paths in check mode.
+    """
+    stale = []
+    for folder in folders:
+        source_root = ROOT / folder
+        target_root = ROOT / "catalog" / "desktop" / folder
+        wanted = {}
+        for source in sorted(source_root.rglob("*")):
+            rel = source.relative_to(source_root)
+            if source.is_file() and not any(part.startswith(("_", ".")) for part in rel.parts):
+                wanted[rel.as_posix()] = source.read_bytes()
+        present = {p.relative_to(target_root).as_posix() for p in target_root.rglob("*") if p.is_file()} if target_root.is_dir() else set()
+        for rel, content in wanted.items():
+            target = target_root / rel
+            if check:
+                if not target.is_file() or target.read_bytes() != content:
+                    stale.append(f"catalog/desktop/{folder}/{rel}")
+            elif not target.is_file() or target.read_bytes() != content:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+        for rel in sorted(present - wanted.keys()):
+            if check:
+                stale.append(f"catalog/desktop/{folder}/{rel}")
+            else:
+                (target_root / rel).unlink()
+    return stale
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 42 42">
+  <rect x="1.5" y="8.5" width="39" height="27" rx="3" fill="#81bdc5" stroke="#d8ccae" stroke-width="3"/>
+  <rect x="0" y="34" width="42" height="6" rx="2" fill="#b2915f"/>
+  <path d="M32 34c0-8 2-14 6-17 0 7-1 12-6 17z" fill="#518578"/>
+  <ellipse cx="14" cy="19" rx="6" ry="4" fill="#eeab57">
+    <animate attributeName="cx" values="10;24" dur="4s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines=".4 0 .6 1"/>
+  </ellipse>
+</svg>

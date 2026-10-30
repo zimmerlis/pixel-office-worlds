@@ -28,11 +28,29 @@ const ROSTER_KEY = [ID, 'roster']
 const META_NS = 'hermes-bots'
 const DRAG_PX = 8
 const SLEEP_HOLD_MS = 1200
+// Every mood a desk sprite can be swapped for. 'idle' also serves as the fallback for the rest.
+const SPRITE_MOODS = [
+  { id: 'idle', name: 'Idle (fallback for the rest)' },
+  { id: 'think', name: 'Thinking / working' },
+  { id: 'held', name: 'Picked up / dragged' },
+  { id: 'sleep', name: 'Asleep' },
+  { id: 'pet', name: 'Being petted' },
+  { id: 'clap', name: 'Celebrating' },
+  { id: 'stretch', name: 'Stretching / yawning' },
+  { id: 'shy', name: 'Startled' },
+  { id: 'peek', name: 'Peeking' },
+  { id: 'bored', name: 'Bored' },
+  { id: 'failed', name: 'Task failed (falls back to Picked up)' },
+  { id: 'walkfront', name: 'Moving towards the viewer' },
+  { id: 'walkback', name: 'Moving away from the viewer' }
+]
 const $seats = atom({})
 const $drag = atom(null)
 const $fx = atom({})
+const $agentActivity = atom({})
 const $peekUntil = atom(0)
 const $walks = atom({})
+const $walkSpriteReady = atom({})
 const $roam = atom({})
 const $clockKind = atom('digital')
 const $clockPos = atom(null)
@@ -50,6 +68,12 @@ const $week = atom(null)
 const $month = atom(null)
 const $hint = atom('off')
 const $news = atom({})
+const $background = atom({})
+const BACKGROUND_STALE_MS = 15 * 60 * 1000
+const backgroundSessions = new Map()
+const $logbook = atom([])
+const LOGBOOK_MAX = 200
+const jobRuns = new Map()
 const $officeInput = atom({})
 const $ritual = atom({ hour: -1, at: 0 })
 const JOBS_STORAGE_KEY = 'jobs'
@@ -272,7 +296,6 @@ function skinCss(name, skin) {
   const night = 'linear-gradient(rgba(9,11,42,.52), rgba(9,11,42,.52))'
   const floor = `url("${skin.floor}") 0 ${WALL_H}px / ${skin.floorSize} repeat local`
   const wall = `url("${skin.wall}") 0 0 / ${skin.wallSize} repeat-x`
-
   return `
 .office-room.is-${name} { background: ${floor}, ${skin.floorColor}; }
 .office-room.is-${name} .office-wall { background: ${wall}, ${skin.wallColor}; }
@@ -380,13 +403,400 @@ function botLook(bot) {
   const meta = botMeta(bot)
   const name = bot.name || 'agent'
   const isPrimary = name.trim().toLowerCase() === 'default'
-  const color = meta.color || (isPrimary ? '#8b5cf6' : profileColor(name) || '#8b5cf6')
+  const mode = $spriteMode.get()
+  const choice = mode === 'sprites' ? spriteChoice(name) : null
+  const color = choice?.color.swatch || meta.color || (isPrimary ? '#8b5cf6' : profileColor(name) || '#8b5cf6')
   const cached = $avatars.get()[name]
+  const images = choice ? { ...choice.set.shared, ...choice.color.images } : null
 
   return {
     color,
-    image: typeof meta.image === 'string' ? meta.image : cached || null,
+    image: mode === 'icons' ? null : typeof meta.image === 'string' ? meta.image : cached || null,
+    images,
     title: displayName(bot, meta)
+  }
+}
+
+// Character sets live in characters/<set>/ next to this plugin. Each set has its
+// own sprites.json and files named <color>_<mood>.gif; they are resolved to data
+// URLs in memory at load time. Which agent uses which set and color is chosen in
+// the Sprites panel ($spriteAssign), not by agent name.
+const SPRITE_DIR = 'characters'
+const SPRITE_CONFIG_FILE = 'sprites.json'
+const WORLD_CONFIG_FILE = 'world.json'
+const WORLD_DIR = 'world'
+const SPRITE_FILE_RE = /^([^_-]+)[_-](.+)\.(gif|png|webp|apng|jpe?g)$/i
+const DEFAULT_MOOD_ALIASES = {
+  think: ['think', 'thinking'],
+  peek: ['peek', 'working'],
+  clap: ['clap', 'success'],
+  pet: ['pet', 'success'],
+  held: ['held', 'alert'],
+  failed: ['failed', 'alert'],
+  walkfront: ['walkfront', 'move_front'],
+  walkback: ['walkback', 'move_back']
+}
+const $botSprites = atom({})
+const $characterWorlds = atom({})
+const $spriteAssign = atom({})
+const $spriteStatus = atom('')
+let pluginDirPath = null
+
+// revealPath selects the item in its parent folder, so pointing it at plugin.js opens the plugin folder.
+async function openPluginFolder() {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+
+  try {
+    const dir = pluginDirPath || (desktop ? await findPluginDir(desktop) : null)
+    if (!dir || !desktop?.revealPath) throw new Error('unavailable')
+    pluginDirPath = dir
+    const ok = await desktop.revealPath(joinPath(dir, 'plugin.js'))
+    if (!ok) await desktop.revealPath(dir)
+  } catch {
+    $spriteStatus.set('Could not open the plugin folder.')
+  }
+}
+// How agents look: 'icons' (plugin default faces), 'avatars' (Hermes agent avatars) or 'sprites'.
+const SPRITE_MODES = ['icons', 'avatars', 'sprites']
+const $spriteMode = atom('sprites')
+// The world (room background, props, desk) is a folder with a world.json: the
+// default one is world/ in the plugin root (icons and avatars), and a character
+// set may carry its own world.json that overrides single slots in sprites mode.
+const $defaultWorld = atom(null)
+const $spriteWorld = atom('')
+const $worldArt = atom({ props: {}, desk: null })
+
+function setSpriteWorld(id) {
+  $spriteWorld.set(id)
+  savePref('spriteWorld', id)
+  applyWorld()
+}
+
+// Each character set can define one world in characters/<set>/world/.
+function findWorld(id) {
+  const worldId = String(id || '')
+  const setId = worldId.includes('/') ? worldId.split('/')[0] : worldId
+  return $characterWorlds.get()[setId] || null
+}
+
+function listWorlds() {
+  return Object.entries($characterWorlds.get())
+    .map(([id, world]) => ({ id, label: `${world.setName}: ${world.name || 'World'}` }))
+}
+
+function applyWorld() {
+  if (typeof document === 'undefined') return
+  const own = $spriteMode.get() === 'sprites' ? findWorld($spriteWorld.get()) : null
+  const base = $defaultWorld.get()
+  const wallFrom = own?.wall ? own : base
+  const floorFrom = own?.floor ? own : base
+  const bg = {
+    wall: wallFrom?.wall,
+    wallSize: wallFrom?.wallSize,
+    wallColor: own?.wallColor || base?.wallColor,
+    floor: floorFrom?.floor,
+    floorSize: floorFrom?.floorSize,
+    floorColor: own?.floorColor || base?.floorColor
+  }
+  $worldArt.set({ props: { ...(base?.props || {}), ...(own?.props || {}) }, desk: own?.desk || base?.desk || null })
+  let style = document.getElementById('hermes-office-skin')
+
+  if (!bg.wall && !bg.floor) {
+    style?.remove()
+    return
+  }
+
+  const builtin = OFFICE_SKINS.carpet
+  const skin = {
+    wall: bg.wall || builtin.wall,
+    wallSize: bg.wall ? bg.wallSize : builtin.wallSize,
+    wallColor: bg.wallColor || builtin.wallColor,
+    floor: bg.floor || builtin.floor,
+    floorSize: bg.floor ? bg.floorSize : builtin.floorSize,
+    floorColor: bg.floorColor || builtin.floorColor
+  }
+
+  if (!style) {
+    style = document.createElement('style')
+    style.id = 'hermes-office-skin'
+  }
+
+  // Scope the world skin to this plugin's own room, so another office plugin
+  // installed next to it keeps its own look.
+  style.textContent = skinCss('carpet', skin)
+    .replace(/(^|[\s,}])\.office-room\.is-/g, '$1.office-root.is-worlds .office-room.is-')
+    .split('.office-root.is-night .office-root.is-worlds .office-room.').join('.office-root.is-worlds.is-night .office-room.')
+  document.head.appendChild(style)
+}
+
+async function loadWorld(desktop, folder, cache) {
+  const read = await desktop.readFileText(joinPath(folder, WORLD_CONFIG_FILE)).catch(() => null)
+  if (typeof read?.text !== 'string') return null
+  const config = JSON.parse(read.text)
+  const text = (value, fallback) => (typeof value === 'string' && value.trim() ? value.trim() : fallback)
+  const props = {}
+
+  for (const [id, file] of Object.entries(config.props || {})) {
+    const url = await resolveSpriteSource(desktop, folder, file, cache)
+    if (url) props[id] = url
+  }
+
+  return {
+    name: text(config.name, ''),
+    setName: text(config.setName, ''),
+    wall: await resolveSpriteSource(desktop, folder, config.wall, cache),
+    floor: await resolveSpriteSource(desktop, folder, config.floor, cache),
+    wallSize: text(config.wallSize, `160px ${WALL_H}px`),
+    floorSize: text(config.floorSize, '96px 96px'),
+    wallColor: text(config.wallColor, ''),
+    floorColor: text(config.floorColor, ''),
+    desk: await resolveSpriteSource(desktop, folder, config.desk, cache),
+    props
+  }
+}
+
+function setSpriteMode(mode) {
+  if (!SPRITE_MODES.includes(mode)) return
+  $spriteMode.set(mode)
+  savePref('spriteMode', mode)
+  applyWorld()
+}
+
+function spriteChoice(name) {
+  const sets = $botSprites.get()
+  const ids = Object.keys(sets)
+  if (!ids.length) return null
+  const saved = $spriteAssign.get()[name]
+  const worldSetId = $spriteWorld.get().split('/')[0]
+  const set = sets[worldSetId] || sets[saved?.set] || sets[ids[0]]
+  const colorIds = Object.keys(set.colors)
+  const hint = set.suggest[String(name).toLowerCase()]
+  const colorId = set.colors[saved?.color] ? saved.color : set.colors[hint] ? hint : colorIds[nameHash(name) % colorIds.length]
+  return { set, color: set.colors[colorId] }
+}
+
+function assignSprite(name, patch) {
+  const current = spriteChoice(name)
+  const set = $botSprites.get()[patch.set || current?.set.id]
+  if (!current || !set) return
+  const wanted = patch.color || current.color.id
+  const color = set.colors[wanted] ? wanted : Object.keys(set.colors)[0]
+  const next = { ...$spriteAssign.get(), [name]: { set: set.id, color } }
+  $spriteAssign.set(next)
+  savePref('spriteAssign', next)
+}
+const spriteStartTimes = new Map()
+const spriteLoadCache = new Map()
+const pendingWalks = new Map()
+
+function spriteStartTime(name) {
+  if (!spriteStartTimes.has(name)) {
+    spriteStartTimes.set(name, Date.now() + (nameHash(name) % 1001))
+  }
+  return spriteStartTimes.get(name)
+}
+
+function preloadSprite(src) {
+  if (!src) return Promise.resolve(false)
+  if (spriteLoadCache.has(src)) return spriteLoadCache.get(src).promise
+  if (typeof Image === 'undefined') return Promise.resolve(false)
+
+  const image = new Image()
+  const promise = new Promise(resolve => {
+    image.onload = () => resolve(true)
+    image.onerror = () => {
+      spriteLoadCache.delete(src)
+      resolve(false)
+    }
+    image.src = src
+  })
+  spriteLoadCache.set(src, { image, promise })
+  return promise
+}
+
+function cancelPendingWalk(name) {
+  pendingWalks.delete(name)
+}
+
+function joinPath(dir, rel) {
+  const backslash = String.fromCharCode(92)
+  const sep = dir.includes(backslash) ? backslash : '/'
+  const base = dir.endsWith('/') || dir.endsWith(backslash) ? dir.slice(0, -1) : dir
+  return [base, ...String(rel).split('/').filter(Boolean)].join(sep)
+}
+
+// The plugin folder is the one under the desktop plugins root that holds characters/.
+async function findPluginDir(desktop) {
+  const root = await desktop.desktopPluginsRoot?.()
+  if (!root) return null
+  const { entries } = await desktop.readDir(root)
+
+  // Only a folder with an active plugin.js of this plugin next to characters/ counts,
+  // so a disabled backup copy or another plugin with its own characters/ is skipped.
+  for (const entry of entries.filter(e => e.isDirectory)) {
+    const inner = await desktop.readDir(entry.path).catch(() => null)
+    const names = inner?.entries || []
+    if (!names.some(e => e.isDirectory && e.name === SPRITE_DIR)) continue
+    if (!names.some(e => !e.isDirectory && e.name === 'plugin.js')) continue
+    const read = await desktop.readFileText(joinPath(entry.path, 'plugin.js')).catch(() => null)
+    if (!read?.text || read.text.includes(`const ID = '${ID}'`)) return entry.path
+  }
+
+  return null
+}
+
+async function resolveSpriteSource(desktop, folder, value, cache) {
+  const src = typeof value === 'string' ? value.trim() : ''
+  if (!src) return null
+  if (/^(data:|https?:)/i.test(src)) return src
+  const path = joinPath(folder, src)
+  if (!cache.has(path)) {
+    const url = await desktop.readFileDataUrl(path).catch(() => null)
+    cache.set(path, typeof url === 'string' ? url : null)
+  }
+  return cache.get(path)
+}
+
+async function resolveSpriteMap(desktop, folder, files, cache) {
+  const out = {}
+
+  for (const mood of SPRITE_MOODS) {
+    const url = await resolveSpriteSource(desktop, folder, files?.[mood.id], cache)
+    if (url) out[mood.id] = url
+  }
+
+  return out
+}
+
+const spriteSuffix = value => String(value).toLowerCase().replace(/-/g, '_')
+
+// A set's colors come from "colors" in its sprites.json plus every <color>_<mood>
+// file found in the folder. "aliases" maps a mood to the file suffixes it accepts
+// (first one wins), "fallback" lets a missing mood reuse another one.
+async function loadSpriteSet(desktop, folder, id, cache) {
+  const read = await desktop.readFileText(joinPath(folder, SPRITE_CONFIG_FILE)).catch(() => null)
+  if (typeof read?.text !== 'string') return null
+  const config = JSON.parse(read.text)
+  const aliases = { ...DEFAULT_MOOD_ALIASES, ...(config.aliases || {}) }
+  const suffixRank = new Map()
+
+  for (const mood of SPRITE_MOODS) {
+    const suffixes = [mood.id, ...(Array.isArray(aliases[mood.id]) ? aliases[mood.id] : [])]
+    suffixes.forEach((suffix, rank) => {
+      const key = spriteSuffix(suffix)
+      if (!suffixRank.has(key)) suffixRank.set(key, [])
+      suffixRank.get(key).push({ mood: mood.id, rank })
+    })
+  }
+
+  const colors = {}
+  const ensure = key => (colors[key] ||= { id: key, label: key.charAt(0).toUpperCase() + key.slice(1), swatch: '#8b5cf6', files: {}, ranks: {} })
+
+  for (const [key, meta] of Object.entries(config.colors || {})) {
+    const color = ensure(key.toLowerCase())
+    if (typeof meta?.label === 'string' && meta.label.trim()) color.label = meta.label.trim()
+    if (typeof meta?.swatch === 'string' && meta.swatch.trim()) color.swatch = meta.swatch.trim()
+    for (const [mood, file] of Object.entries(meta?.files || {})) color.files[mood] = file
+  }
+
+  const listing = await desktop.readDir(folder).catch(() => null)
+
+  for (const entry of listing?.entries || []) {
+    if (entry.isDirectory) continue
+    const match = SPRITE_FILE_RE.exec(entry.name || '')
+    const hits = match ? suffixRank.get(spriteSuffix(match[2])) : null
+    if (!hits) continue
+    const color = ensure(match[1].toLowerCase())
+
+    for (const { mood, rank } of hits) {
+      if (color.files[mood] && !(mood in color.ranks)) continue
+      if (!(mood in color.ranks) || rank < color.ranks[mood]) {
+        color.files[mood] = entry.name
+        color.ranks[mood] = rank
+      }
+    }
+  }
+
+  const resolved = {}
+
+  for (const color of Object.values(colors)) {
+    const images = await resolveSpriteMap(desktop, folder, color.files, cache)
+
+    for (const [mood, from] of Object.entries(config.fallback || {})) {
+      if (!images[mood] && images[from]) images[mood] = images[from]
+    }
+
+    if (Object.keys(images).length) resolved[color.id] = { id: color.id, label: color.label, swatch: color.swatch, images }
+  }
+
+  const suggest = {}
+  for (const [name, color] of Object.entries(config.suggest || {})) suggest[name.toLowerCase()] = String(color).toLowerCase()
+
+  return {
+    id,
+    name: typeof config.name === 'string' && config.name.trim() ? config.name.trim() : id,
+    colors: resolved,
+    suggest,
+    shared: await resolveSpriteMap(desktop, folder, config.default, cache)
+  }
+}
+
+async function loadSpriteConfig() {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+
+  if (!desktop?.readFileText || !desktop?.readFileDataUrl || !desktop?.readDir) {
+    $spriteStatus.set('This Hermes Desktop cannot read plugin files.')
+    return
+  }
+
+  try {
+    const dir = await findPluginDir(desktop)
+    if (dir) pluginDirPath = dir
+    if (!dir) {
+      $spriteStatus.set(`No ${SPRITE_DIR}/ folder found next to the plugin.`)
+      return
+    }
+
+    const base = joinPath(dir, SPRITE_DIR)
+    const listing = await desktop.readDir(base)
+    const folders = (listing?.entries || [])
+      .filter(e => e.isDirectory && !/^[._]/.test(e.name))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    const cache = new Map()
+    const next = {}
+    const problems = []
+
+    for (const entry of folders) {
+      try {
+        const set = await loadSpriteSet(desktop, joinPath(base, entry.name), entry.name, cache)
+        if (set && Object.keys(set.colors).length) next[entry.name] = set
+        else problems.push(`${entry.name}: no ${SPRITE_CONFIG_FILE} or no sprites`)
+      } catch (error) {
+        problems.push(`${entry.name}: ${String(error?.message || error)}`)
+      }
+    }
+
+    $botSprites.set(next)
+    const worlds = {}
+    for (const entry of folders) {
+      const world = await loadWorld(desktop, joinPath(joinPath(base, entry.name), WORLD_DIR), cache).catch(() => null)
+      if (world) worlds[entry.name] = { ...world, setName: world.setName || next[entry.name]?.name || entry.name }
+    }
+    $characterWorlds.set(worlds)
+    const selectedWorld = $spriteWorld.get()
+    if (selectedWorld.includes('/')) {
+      const legacySetId = selectedWorld.split('/')[0]
+      if (worlds[legacySetId]) {
+        $spriteWorld.set(legacySetId)
+        savePref('spriteWorld', legacySetId)
+      }
+    }
+    $defaultWorld.set(await loadWorld(desktop, joinPath(dir, WORLD_DIR), cache).catch(() => null))
+    applyWorld()
+    const loaded = Object.values(next).map(set => `${set.name} (${Object.keys(set.colors).length})`).join(', ')
+    $spriteStatus.set(`Loaded from ${base}: ${loaded || 'no character sets'}${problems.length ? ` · skipped ${problems.join('; ')}` : ''}`)
+  } catch (error) {
+    $spriteStatus.set(`Could not load ${SPRITE_DIR}/: ${String(error?.message || error)}`)
   }
 }
 
@@ -531,6 +941,9 @@ function taskTransition(job, event) {
   if (terminal) {
     return job
   }
+  if (event.type === 'activity' && ['idle', 'think', 'peek'].includes(event.activity)) {
+    return { ...job, activity: event.activity }
+  }
   if (event.type === 'accepted') {
     return { ...job, state: JOB_STATES.RUNNING, acceptedAt: event.at || job.acceptedAt || Date.now() }
   }
@@ -556,6 +969,15 @@ function jobIsActive(row) {
   // Keep this helper independent so pure movement tests can extract it from
   // the single-file runtime without booting the SDK.
   return Boolean(row && (row.state === 'submitting' || row.state === 'running' || typeof row.t0 === 'number'))
+}
+
+function jobActivity(row) {
+  if (!jobIsActive(row)) return 'idle'
+  return ['idle', 'think', 'peek'].includes(row.activity) ? row.activity : 'idle'
+}
+
+function activityForAgent(name, jobs) {
+  return jobIsActive(jobs?.[name]) ? jobActivity(jobs[name]) : $agentActivity.get()[name] || 'idle'
 }
 
 function jobAllowsSubmission(row) {
@@ -593,6 +1015,7 @@ function normalizeJobs(value) {
       runtimeSessionId: row.runtimeSessionId ? String(row.runtimeSessionId) : null,
       submittedAt: Number.isFinite(row.submittedAt) ? row.submittedAt : Date.now(),
       state,
+      activity: 'idle',
       prompt: String(row.prompt || '').slice(0, TASK_PROMPT_MAX),
       effectsApplied: Boolean(row.effectsApplied)
     }
@@ -1159,10 +1582,7 @@ function roamPoint(roomEl, avoid) {
 
 function setRoam(name, from, roomEl) {
   const to = roamPoint(roomEl, from)
-  $roam.set({
-    ...$roam.get(),
-    [name]: { from, to, t0: Date.now(), ms: roamMs(from, to), rest: 500 + Math.random() * 700 }
-  })
+  beginRoam(name, from, to, roamMs(from, to), 500 + Math.random() * 700)
 }
 
 function clearRoam(name) {
@@ -1178,6 +1598,16 @@ function clearRoam(name) {
 
 function tickRoam(now, roomEl, opts = {}) {
   if (!roomEl) {
+    return
+  }
+
+  // Quiet means idle bots stay at their desks. Keep explicit game movement
+  // (for example musical chairs) working, but stop autonomous roaming.
+  if (!opts.scramble && $officeLife.get()?.chaos === 'quiet') {
+    for (const [name, token] of pendingWalks) {
+      if (token.kind === 'roam') pendingWalks.delete(name)
+    }
+    if (Object.keys($roam.get()).length) $roam.set({})
     return
   }
 
@@ -1201,7 +1631,7 @@ function tickRoam(now, roomEl, opts = {}) {
       continue
     }
 
-    if (drag?.name === name || walks[name]) {
+    if (drag?.name === name || walks[name] || pendingWalks.has(name)) {
       continue
     }
 
@@ -1224,8 +1654,7 @@ function tickRoam(now, roomEl, opts = {}) {
     const from = leg ? leg.to : seats[name]
     const to = scramble && opts.ring ? ringPoint(opts.ring, from) : roamPoint(roomEl, from)
     const ms = scramble ? Math.max(420, roamMs(from, to) * 0.42) : roamMs(from, to)
-    nextRoam[name] = { from, to, t0: now, ms, rest: scramble ? 60 + Math.random() * 80 : 500 + Math.random() * 700 }
-    roamDirty = true
+    beginRoam(name, from, to, ms, scramble ? 60 + Math.random() * 80 : 500 + Math.random() * 700)
 
     if (leg) {
       nextSeats[name] = from
@@ -1450,11 +1879,136 @@ function currentJob(name, id) {
   return row && (!id || row.id === id) ? row : null
 }
 
+function jobRun(id) {
+  if (!jobRuns.has(id)) {
+    if (jobRuns.size > 50) jobRuns.delete(jobRuns.keys().next().value)
+    jobRuns.set(id, { tools: {}, toolCount: 0, text: '' })
+  }
+  return jobRuns.get(id)
+}
+
+function eventText(payload) {
+  const value = payload?.text ?? payload?.content ?? payload?.message?.content ?? payload?.message ?? payload?.summary
+  return typeof value === 'string' ? value : ''
+}
+
+function normalizeLogbook(value) {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter(e => e && typeof e === 'object' && Number.isFinite(e.at) && typeof e.agent === 'string')
+    .slice(-LOGBOOK_MAX)
+}
+
+function appendLogEntry(row) {
+  const run = jobRuns.get(row.id)
+  const start = row.startedAt || row.acceptedAt || row.submittedAt
+  const end = row.completedAt || Date.now()
+  const summary = (run?.text || '').replace(/\s+/g, ' ').trim().slice(0, 400)
+  const entry = {
+    at: end,
+    agent: row.profile,
+    state: row.state,
+    task: String(row.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    summary,
+    error: row.error ? String(row.error).slice(0, 300) : '',
+    durationMs: Number.isFinite(start) ? Math.max(0, end - start) : 0,
+    tools: run?.tools || {},
+    toolCount: run?.toolCount || 0
+  }
+  const next = [...$logbook.get().filter(e => !(e.id && e.id === row.id)), { ...entry, id: row.id }].slice(-LOGBOOK_MAX)
+  $logbook.set(next)
+  savePref('logbook', next)
+  jobRuns.delete(row.id)
+}
+
+function publishBackground() {
+  const next = {}
+  for (const rec of backgroundSessions.values()) {
+    const cur = next[rec.profile]
+    if (!cur) next[rec.profile] = { since: rec.since, activity: rec.activity, tool: rec.tool, count: 1 }
+    else {
+      cur.since = Math.min(cur.since, rec.since)
+      cur.count += 1
+      if (rec.activity === 'peek' || (rec.activity === 'think' && cur.activity === 'idle')) {
+        cur.activity = rec.activity
+        cur.tool = rec.tool
+      }
+    }
+  }
+  $background.set(next)
+}
+
+function pruneBackground(now = Date.now()) {
+  let changed = false
+  for (const [key, rec] of backgroundSessions) {
+    if (now - rec.seen > BACKGROUND_STALE_MS) {
+      backgroundSessions.delete(key)
+      jobRuns.delete(rec.id)
+      changed = true
+    }
+  }
+  if (changed) publishBackground()
+}
+
+// Sessions that were not started from the office (other chats, scheduled or
+// background runs) are tracked from the event stream only.
+function trackBackground(event, profile, sid) {
+  const type = event?.type
+  const key = `${profile}|${sid}`
+  const now = Date.now()
+  let rec = backgroundSessions.get(key)
+  if (type === 'message.complete') {
+    if (!rec) return
+    backgroundSessions.delete(key)
+    const failed = event.payload?.status === 'error'
+    const text = eventText(event.payload)
+    if (text) jobRun(rec.id).text = text
+    appendLogEntry({
+      id: rec.id,
+      profile,
+      state: failed ? JOB_STATES.FAILED : JOB_STATES.COMPLETED,
+      prompt: 'Background session (not started from the office)',
+      startedAt: rec.since,
+      completedAt: now,
+      error: failed ? event.payload?.error || 'The session failed.' : null
+    })
+    publishBackground()
+    return
+  }
+  if (!['message.start', 'tool.start', 'tool.complete'].includes(type)) return
+  if (!rec) {
+    if (type === 'tool.complete') return
+    rec = { id: `bg-${sid}-${now}`, profile, since: now, seen: now, activity: 'idle', tool: '' }
+    backgroundSessions.set(key, rec)
+  }
+  rec.seen = now
+  if (type === 'message.start') rec.activity = 'think'
+  else if (type === 'tool.start') {
+    rec.activity = 'peek'
+    rec.tool = String(event.payload?.name || event.payload?.tool_name || event.payload?.tool || 'tool').slice(0, 60)
+    const run = jobRun(rec.id)
+    run.tools[rec.tool] = (run.tools[rec.tool] || 0) + 1
+    run.toolCount += 1
+  } else rec.activity = 'idle'
+  publishBackground()
+}
+
+function withBackgroundJobs(own, background) {
+  let out = own
+  for (const [name, bg] of Object.entries(background)) {
+    if (jobIsActive(own[name])) continue
+    if (out === own) out = { ...own }
+    out[name] = { id: `bg-${name}`, profile: name, state: JOB_STATES.RUNNING, activity: bg.activity, submittedAt: bg.since, prompt: 'Background session', background: true }
+  }
+  return out
+}
+
 function updateJob(name, id, event) {
   const current = currentJob(name, id)
   if (!current) return null
   const next = taskTransition(current, event)
   if (next === current) return current
+  if (next.state !== current.state && [JOB_STATES.COMPLETED, JOB_STATES.FAILED, JOB_STATES.UNKNOWN].includes(next.state)) appendLogEntry(next)
   if (!jobIsActive(next)) clearOfficeInput(name)
   $jobs.set({ ...$jobs.get(), [name]: next })
   saveJobs()
@@ -1476,6 +2030,7 @@ function markJob(bot, chat, prompt, route) {
     prompt: String(prompt || '').slice(0, TASK_PROMPT_MAX),
     submittedAt: Date.now(),
     state: JOB_STATES.SUBMITTING,
+    activity: 'idle',
     error: null,
     effectsApplied: false,
     round: id
@@ -1515,15 +2070,39 @@ function finishJob(name, id, event) {
 
 function handleJobEvent(event) {
   const sid = event?.session_id
+  const activity = event?.type === 'message.start'
+    ? 'think'
+    : event?.type === 'tool.start'
+      ? 'peek'
+      : ['tool.complete', 'message.complete'].includes(event?.type)
+        ? 'idle'
+        : null
+  const profile = typeof event?.profile === 'string' ? event.profile.trim() : ''
+  if (profile && activity) {
+    $agentActivity.set({ ...$agentActivity.get(), [profile]: activity })
+  }
   if (!sid) return
+  if (profile && !Object.values($jobs.get()).some(row => row.runtimeSessionId === sid)) trackBackground(event, profile, sid)
   for (const [name, row] of Object.entries($jobs.get())) {
     if (row.runtimeSessionId !== sid) continue
     if (row.connectionId && event.connectionId && row.connectionId !== event.connectionId) continue
     if (row.targetProfile && event.profile && row.targetProfile !== event.profile) continue
+    if (activity) $agentActivity.set({ ...$agentActivity.get(), [name]: activity })
     handleOfficeInput(name, row, event)
     if (event.type === 'message.start') {
       updateJob(name, row.id, { type: 'started' })
+      updateJob(name, row.id, { type: 'activity', activity: 'think' })
+    } else if (event.type === 'tool.start') {
+      const run = jobRun(row.id)
+      const tool = String(event.payload?.name || event.payload?.tool_name || event.payload?.tool || 'tool').slice(0, 60)
+      run.tools[tool] = (run.tools[tool] || 0) + 1
+      run.toolCount += 1
+      updateJob(name, row.id, { type: 'activity', activity: 'peek' })
+    } else if (event.type === 'tool.complete') {
+      updateJob(name, row.id, { type: 'activity', activity: 'idle' })
     } else if (event.type === 'message.complete') {
+      const text = eventText(event.payload)
+      if (text) jobRun(row.id).text = text
       const failure = event.payload?.status === 'error'
       if (failure) {
         updateJob(name, row.id, { type: 'failed', error: event.payload?.error || 'The task failed.' })
@@ -1681,8 +2260,13 @@ function faceOn(roomEl, el, lift = 0) {
 
 function deskPersonPos(name, roomEl) {
   const desk = roomEl?.querySelector(`[data-desk=${JSON.stringify(name)}]`)
-  const slot = desk?.querySelector('.office-person .office-face') || desk?.querySelector('.office-desk-chair') || desk
-  return faceOn(roomEl, slot)
+  const face = desk?.querySelector('.office-person .office-face')
+  if (face) {
+    return faceOn(roomEl, face)
+  }
+
+  // Chair is hidden, so the empty seat stands in for it; the standing spot is 30px lower.
+  return faceOn(roomEl, desk?.querySelector('.office-seat') || desk, -30)
 }
 
 function currentPos(name, roomEl, now = Date.now()) {
@@ -1716,21 +2300,67 @@ function setWalk(name, walk) {
   $walks.set(next)
 }
 
+function movementMood(from, to) {
+  return (to?.y || 0) >= (from?.y || 0) ? 'walkfront' : 'walkback'
+}
+
+async function loadMovementSprites(name, points) {
+  const images = botLook({ name }).images || {}
+  const moods = [...new Set(points.slice(1).map((point, index) => movementMood(points[index], point)))]
+  const sources = new Map(moods.filter(mood => images[mood]).map(mood => [mood, images[mood]]))
+  const readiness = {}
+  const results = await Promise.all([...sources].map(async ([mood, src]) => [mood, await preloadSprite(src)]))
+  for (const [mood, loaded] of results) {
+    readiness[mood] = loaded
+    if (!loaded) console.error(`Could not load ${mood} sprite for ${name}; using its idle sprite while moving.`)
+  }
+  return readiness
+}
+
+function recordMovementSprites(name, readiness) {
+  if (!Object.keys(readiness).length) return
+  $walkSpriteReady.set({
+    ...$walkSpriteReady.get(),
+    [name]: { ...($walkSpriteReady.get()[name] || {}), ...readiness }
+  })
+}
+
+function beginRoam(name, from, to, ms, rest) {
+  if (pendingWalks.has(name)) return
+  const token = { kind: 'roam' }
+  pendingWalks.set(name, token)
+  void loadMovementSprites(name, [from, to]).then(readiness => {
+    if (pendingWalks.get(name) !== token) return
+    pendingWalks.delete(name)
+    if ($drag.get()?.name === name || $walks.get()[name] || jobIsActive($jobs.get()[name])) return
+    if (($game.get()?.players || []).includes(name)) return
+    recordMovementSprites(name, readiness)
+    $roam.set({ ...$roam.get(), [name]: { from, to, t0: Date.now(), ms, rest } })
+  })
+}
+
 function startWalk(name, to, roomEl, kind, path) {
   const from = currentPos(name, roomEl)
+  if (!from || !to) return false
+
   clearRoam(name)
+  if ($drag.get()?.name === name) $drag.set(null)
+  setWalk(name, null)
+  saveSeats({ ...$seats.get(), [name]: from })
 
-  if (!from || !to) {
-    return false
-  }
+  const token = {}
+  pendingWalks.set(name, token)
+  const points = [from, to, ...(Array.isArray(path) ? path : [])]
+  void loadMovementSprites(name, points)
+    .then(readiness => {
+      if (pendingWalks.get(name) !== token) return
+      pendingWalks.delete(name)
+      if ($drag.get()?.name === name) return
 
-  if ($drag.get()?.name === name) {
-    $drag.set(null)
-  }
+      recordMovementSprites(name, readiness)
+      setWalk(name, beginWalk(from, to, Date.now(), kind, path))
+    })
 
-  const seats = { ...$seats.get(), [name]: from }
-  saveSeats(seats)
-  setWalk(name, beginWalk(from, to, Date.now(), kind, path))
   return true
 }
 
@@ -1753,7 +2383,7 @@ function startWalkHome(name, roomEl) {
   }
 
   const desk = roomEl.querySelector(`[data-desk=${JSON.stringify(name)}]`)
-  const slot = desk?.querySelector('.office-desk-chair') || desk
+  const slot = desk?.querySelector('.office-seat') || desk
   if (!slot) {
     const next = { ...$seats.get() }
     delete next[name]
@@ -1762,7 +2392,7 @@ function startWalkHome(name, roomEl) {
     return
   }
 
-  startWalk(name, faceOn(roomEl, slot), roomEl, 'home')
+  startWalk(name, faceOn(roomEl, slot, -30), roomEl, 'home')
 }
 
 function stoolPoints(roomEl) {
@@ -2234,7 +2864,18 @@ function tickGame(now, roomEl, jobs) {
   }
 }
 
-function WorkerFace({ color, image, mood, size = 36, name, sad = false }) {
+function WorkerFace({ color, image, images, mood, size = 36, name, sad = false }) {
+  const sprite = mood === 'bored' ? images?.idle || image : mood === 'failed' ? images?.failed || images?.held || images?.idle || image : images?.[mood] || images?.idle || image
+  const [spriteReady, setSpriteReady] = useState(() => Date.now() >= spriteStartTime(name))
+  const startAt = spriteStartTime(name)
+  useEffect(() => {
+    if (spriteReady) return undefined
+    const timer = setTimeout(() => setSpriteReady(true), Math.max(0, startAt - Date.now()))
+    return () => clearTimeout(timer)
+  }, [spriteReady, startAt])
+  const movementSprite = mood === 'walkfront' || mood === 'walkback'
+  const showSprite = sprite && (spriteReady || movementSprite)
+  const isGif = Boolean(images)
   const shy = mood === 'shy' || mood === 'held'
   const sleep = mood === 'sleep'
   const peek = mood === 'peek'
@@ -2246,13 +2887,13 @@ function WorkerFace({ color, image, mood, size = 36, name, sad = false }) {
   const ry = shy ? 3.4 : peek ? 3 : bored ? 1.2 : 2.4
   const hash = nameHash(name)
 
-  if (image) {
+  if (showSprite) {
     return jsx('img', {
-      src: image,
+      src: sprite,
       alt: '',
       'aria-hidden': true,
       draggable: false,
-      className: cn('office-face', `office-face-${mood}`),
+      className: cn('office-face', isGif && 'is-sprite', `office-face-${mood}`),
       style: {
         width: size,
         height: size,
@@ -2413,7 +3054,7 @@ function statusText({ face, isActive, wander, cheers, gamePhase, leftover, pizza
   }
 
   if (face === 'peek') {
-    return 'boo?'
+    return 'using tools'
   }
 
   if (face === 'think') {
@@ -2464,7 +3105,7 @@ function PizzaSlice({ className }) {
   })
 }
 
-function Person({ bot, look, face, wander, closer, whisper, hi, ask, bang, five, yawn, cheers, gamePhase, leftover, pizza, noPizza, walkKind, drop, ritual, taskState, style, onPetStart }) {
+function Person({ bot, look, face, wander, closer, whisper, hi, ask, bang, five, yawn, cheers, gamePhase, leftover, pizza, noPizza, walkKind, walkMood, drop, ritual, taskState, style, onPetStart }) {
   const life = useValue($officeLife)
   const needsInput = Boolean(useValue($officeInput)[bot.name])
   const quirk = officeQuirk(bot.name, life)
@@ -2498,7 +3139,7 @@ function Person({ bot, look, face, wander, closer, whisper, hi, ask, bang, five,
       chatter && chatter.until > Date.now() && face !== 'think' ? jsx('span', { className: 'office-banter', children: chatter.text }) : null,
       wander ? jsx('span', { className: 'office-ground', 'aria-hidden': true }) : null,
       pizza ? jsx(PizzaSlice, { className: 'office-slice' }) : null,
-      jsx(WorkerFace, { color: look.color, image: look.image, mood: face, size: 42, name: bot.name, sad: Boolean(noPizza || leftover) && (face === 'idle' || face === 'stretch') }),
+      jsx(WorkerFace, { color: look.color, image: look.image, images: look.images, mood: walkMood || (taskState === 'failed' && face === 'idle' ? 'failed' : face), size: 42, name: bot.name, sad: Boolean(noPizza || leftover) && (face === 'idle' || face === 'stretch') }),
       jsx('span', {
         className: cn('office-status', (face === 'idle' || face === 'shy' || face === 'sleep') && 'is-idle', noPizza && 'is-sad', quietStatus(status) && 'is-quiet'),
         children: status
@@ -2555,6 +3196,7 @@ function usePersonHandlers(bot, roomRef, held) {
 
         event.preventDefault()
         event.stopPropagation()
+        cancelPendingWalk(bot.name)
         teardownRef.current?.()
         try { event.currentTarget?.setPointerCapture?.(event.pointerId) } catch { /* older browser */ }
         startRef.current = { x: event.clientX, y: event.clientY }
@@ -2629,10 +3271,11 @@ function usePersonHandlers(bot, roomRef, held) {
   }
 }
 
-function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, night, peek, now, onPick, onOpen }) {
+function Desk({ bot, isActive, turnBusy, tasked, taskState, taskActivity, picked, roomRef, night, peek, now, onPick, onOpen }) {
   const look = botLook(bot)
   const needsInput = Boolean(useValue($officeInput)[bot.name])
-  const think = deskMood({ isActive, turnBusy, tasked }) === 'think'
+  const think = taskActivity === 'think'
+  const usingTools = taskActivity === 'peek'
   const handle = botHandle(bot.name)
   const seats = useValue($seats)
   const drag = useValue($drag)
@@ -2651,7 +3294,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
     clap: fx.clap,
     stretch: fx.stretch || fx.yawn,
     shy,
-    peek: peek && !seat,
+    peek: usingTools || (peek && !seat && !tasked),
     think,
     bored
   })
@@ -2674,6 +3317,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
     className: cn(
       'office-desk',
       think && 'is-think',
+      usingTools && 'is-peek',
       isActive && 'is-active',
       picked && 'is-picked',
       seat && 'has-wander',
@@ -2684,7 +3328,22 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
       jsxs('div', {
         className: 'office-stage',
         children: [
-          jsx('div', { className: 'office-desk-top' }),
+          jsxs('button', {
+            type: 'button',
+            className: 'office-tag',
+            onClick: onPick,
+            onDoubleClick: event => {
+              event.preventDefault()
+              event.stopPropagation()
+              void onOpen()
+            },
+            title: `Give ${look.title} a task. Double-click to open their chat.`,
+            children: [
+              `@${handle}`,
+              trophies[bot.name] ? jsx('span', { className: 'office-stars', title: `${trophies[bot.name]} tasks done`, children: `\u2605${trophies[bot.name]}` }) : null
+            ]
+          }),
+          jsx(DeskTop, {}),
           jsx(DeskKeepsakes, { name: bot.name }),
           note
             ? jsx('button', {
@@ -2709,7 +3368,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
                 ]
               })
             : null,
-          jsx(Monitor, { on: think, text: output, since: fx.thinkSince, now, boot: fx.boot, doodle: bored }),
+          jsx(Monitor, { on: think || usingTools, text: output, since: fx.thinkSince, now, boot: fx.boot, doodle: bored }),
           fx.confetti
             ? jsx('div', {
                 className: 'office-confetti',
@@ -2720,7 +3379,8 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
           jsxs('div', {
             className: 'office-seat',
             children: [
-              jsx(DeskChair, { wobble: Boolean(seat) }),
+              // Chairs are hidden: bots stand at their desks now.
+              // jsx(DeskChair, { wobble: Boolean(seat) }),
               seat
                 ? null
                 : jsx(Person, {
@@ -2739,27 +3399,6 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
                     taskState,
                     onPetStart: { ...handlers, isActive }
                   })
-            ]
-          })
-        ]
-      }),
-      jsxs('button', {
-        type: 'button',
-        className: 'office-plate',
-        onClick: onPick,
-        onDoubleClick: event => {
-          event.preventDefault()
-          event.stopPropagation()
-          void onOpen()
-        },
-        title: `Give ${look.title} a task. Double-click to open their chat.`,
-        children: [
-          jsx('div', { className: 'office-name', children: look.title }),
-          jsxs('div', {
-            className: 'office-handle',
-            children: [
-              `@${handle}`,
-              trophies[bot.name] ? jsx('span', { className: 'office-stars', title: `${trophies[bot.name]} tasks done`, children: `\u2605 ${trophies[bot.name]}` }) : null
             ]
           })
         ]
@@ -2816,7 +3455,10 @@ function Monitor({ on, text, since, now, boot, doodle }) {
         children: [
           jsx('div', {
             className: cn('office-screen', on && 'is-on', copy && 'has-copy', boot && 'is-boot'),
-            children: !on && doodle ? jsx(Doodle, {}) : copy ? jsx('div', { className: 'office-screen-copy', children: copy }) : null
+            children: [
+              on ? jsx('div', { className: 'office-screen-run', children: jsx('div', { className: 'office-screen-run-lines', children: Array.from({ length: 24 }, (_, i) => jsx('i', { style: { width: `${28 + (((i % 12) * 37) % 60)}%`, marginLeft: `${((i % 12) % 3) * 4}%` } }, i)) }) }, 'run') : null,
+              !on && doodle ? jsx(Doodle, {}, 'doodle') : copy ? jsx('div', { className: 'office-screen-copy', children: copy }, 'copy') : null
+            ]
           }),
           jsx('div', { className: 'office-monitor-cam' })
         ]
@@ -2827,9 +3469,10 @@ function Monitor({ on, text, since, now, boot, doodle }) {
   })
 }
 
-function WandererBot({ bot, isActive, turnBusy, tasked, taskState, roomRef, now, drag, seats, walk, roam, game }) {
+function WandererBot({ bot, isActive, turnBusy, tasked, taskState, taskActivity, roomRef, now, drag, seats, walk, roam, game }) {
   const look = botLook(bot)
-  const think = deskMood({ isActive, turnBusy, tasked }) === 'think'
+  const walkSpriteReady = useValue($walkSpriteReady)[bot.name] || {}
+  const think = taskActivity === 'think'
   const held = drag?.name === bot.name
   const fx = readFx(bot.name, now)
   const { shy, pet, handlers } = usePersonHandlers(bot, roomRef, held)
@@ -2870,6 +3513,10 @@ function WandererBot({ bot, isActive, turnBusy, tasked, taskState, roomRef, now,
     return null
   }
 
+  const movement = walk || (roam && !held ? roam : null)
+  const candidateMood = movement ? movementMood(movement.from, movement.to) : null
+  const walkMood = candidateMood && walkSpriteReady[candidateMood] ? candidateMood : null
+
   return jsx(Person, {
     bot,
     look,
@@ -2880,7 +3527,7 @@ function WandererBot({ bot, isActive, turnBusy, tasked, taskState, roomRef, now,
       clap: fx.clap,
       stretch: fx.stretch,
       shy,
-      peek: false,
+      peek: taskActivity === 'peek',
       think
     }),
     wander: true,
@@ -2890,6 +3537,7 @@ function WandererBot({ bot, isActive, turnBusy, tasked, taskState, roomRef, now,
     pizza: fx.pizza,
     noPizza: fx.noPizza,
     walkKind: walk?.kind || null,
+    walkMood,
     drop: fx.drop,
     hi: fx.hi,
     ask: fx.ask,
@@ -2901,7 +3549,7 @@ function WandererBot({ bot, isActive, turnBusy, tasked, taskState, roomRef, now,
     style: {
       left: seat.x,
       top: seat.y,
-      transform: squash || undefined,
+      transform: squash && !look.images && !look.image ? squash : undefined,
       '--lift': lift.toFixed(2),
       '--wdx': heading ? `${heading * 2}px` : '0px'
     },
@@ -2939,6 +3587,7 @@ function Wanderers({ roster, isActiveName, turnBusy, jobs, roomRef }) {
             turnBusy,
             tasked: jobIsActive(jobs[bot.name]),
             taskState: jobs[bot.name]?.state,
+            taskActivity: activityForAgent(bot.name, jobs),
             roomRef,
             now,
             drag,
@@ -3266,11 +3915,14 @@ function WallWindow({ sky }) {
   const glass = { day: '#a9d8f2', dawn: '#f6c9a0', dusk: '#f0a05a', night: '#182a58' }[sky.tone]
   const cx = 6 + sky.t * 28
   const cy = 24 - Math.sin(sky.t * Math.PI) * 12
+  const sun = sky.night
+      ? jsx('circle', { cx, cy, r: 3.2 })
+      : jsx('circle', { cx, cy, r: 3.6, fill: sky.tone === 'day' ? '#ffd44d' : '#ffb347' })
   return jsxs('svg', { className: 'office-window', viewBox: '0 0 44 40', width: 44, height: 40, children: [
     jsx('rect', { x: 2, y: 2, width: 40, height: 34, rx: 3, fill: glass }),
     sky.night
-      ? jsxs('g', { fill: '#f4f0d8', children: [jsx('circle', { cx: 12, cy: 10, r: .9 }), jsx('circle', { cx: 30, cy: 14, r: .8 }), jsx('circle', { cx: 22, cy: 24, r: .7 }), jsx('circle', { cx: cx, cy: cy, r: 3.2 })] })
-      : jsx('circle', { cx, cy, r: 3.6, fill: sky.tone === 'day' ? '#ffd44d' : '#ffb347' }),
+      ? jsxs('g', { fill: '#f4f0d8', children: [jsx('circle', { cx: 12, cy: 10, r: .9 }), jsx('circle', { cx: 30, cy: 14, r: .8 }), jsx('circle', { cx: 22, cy: 24, r: .7 }), sun] })
+      : sun,
     jsx('rect', { x: 20.5, y: 2, width: 3, height: 34, fill: '#f4efe6' }),
     jsx('rect', { x: 2, y: 17.5, width: 40, height: 3, fill: '#f4efe6' }),
     jsx('rect', { x: 2, y: 2, width: 40, height: 34, rx: 3, fill: 'none', stroke: '#f4efe6', strokeWidth: 3 }),
@@ -3290,16 +3942,50 @@ function EmployeeOfMonth({ roster }) {
   const look = botLook(bot)
   const n = stats.tasks?.[holder] || 0
   const month = new Date().toLocaleString(undefined, { month: 'long' })
+  const sprite = look.images?.idle || look.image
 
   return jsxs('div', {
     className: 'office-eom',
     title: `Employee of the month: ${look.title}, ${n} task${n === 1 ? '' : 's'} in ${month}`,
     children: [
-      jsx('div', { className: 'office-eom-frame', children: jsx(WorkerFace, { color: look.color, image: look.image, mood: 'idle', size: 30, name: bot.name }) }),
-      jsx('div', { className: 'office-eom-plate', children: 'employee of the month' }),
+      jsxs('div', { className: 'office-eom-award', children: [
+        jsx('div', { className: 'office-eom-plate', children: 'employee of the month' }),
+        jsx('div', { className: 'office-eom-frame', children: jsx(EmployeePortrait, { look, name: bot.name }, sprite || bot.name) })
+      ] }),
       jsx('div', { className: 'office-eom-name', children: look.title })
     ]
   }, holder)
+}
+
+function EmployeePortrait({ look, name }) {
+  const [frozenSprite, setFrozenSprite] = useState(null)
+  const sprite = look.images?.idle || look.image
+
+  if (!sprite) {
+    return jsx(WorkerFace, { color: look.color, mood: 'idle', size: 46, name })
+  }
+
+  return jsx('img', {
+    src: frozenSprite || sprite,
+    alt: '',
+    'aria-hidden': true,
+    draggable: false,
+    className: 'office-face is-sprite office-eom-portrait',
+    onLoad: event => {
+      if (frozenSprite || !/\.gif(?:$|[?#])|^data:image\/gif/i.test(sprite)) return
+      const image = event.currentTarget
+      const canvas = document.createElement('canvas')
+      canvas.width = image.naturalWidth
+      canvas.height = image.naturalHeight
+      const context = canvas.getContext('2d')
+      if (!context) {
+        console.error('Could not freeze the Employee of the Month GIF: canvas is unavailable.')
+        return
+      }
+      context.drawImage(image, 0, 0)
+      setFrozenSprite(canvas.toDataURL('image/png'))
+    }
+  })
 }
 
 // "3 tasks done overall" plus who did what, for the tally board tooltip.
@@ -3313,11 +3999,19 @@ function tallyTitle(tally, trophies, roster) {
   return rows.length ? `${head}\n${rows.join('\n')}` : head
 }
 
+function DeskTop() {
+  const desk = useValue($worldArt).desk
+  return jsx('div', { className: cn('office-desk-top', desk && 'has-art'), children: desk ? jsx('img', { className: 'office-desk-art', src: desk, alt: '', draggable: false }) : null })
+}
+
 function Ambience({ backdrop, tally, sky, roster, trophies }) {
+  const art = useValue($worldArt)
   const bits = [jsx(EmployeeOfMonth, { roster: roster || [] }, 'eom')]
   if (sky) bits.push(jsx(WallWindow, { sky }, 'window'))
   if (tally > 0) bits.push(jsx('div', { className: 'office-tally office-chip', title: tallyTitle(tally, trophies, roster), children: `${tally} done` }, 'tally'))
-  if (backdrop === 'carpet') {
+  if (backdrop === 'carpet' && art.props.cooler) {
+    bits.push(jsx('img', { className: 'office-cooler', src: art.props.cooler, alt: '', draggable: false, width: 22, height: 52 }, 'cooler'))
+  } else if (backdrop === 'carpet') {
     bits.push(jsxs('svg', { className: 'office-cooler', viewBox: '0 0 22 52', width: 22, height: 52, children: [
       jsx('rect', { x: 4, y: 20, width: 14, height: 30, rx: 2, fill: '#e9ecf0' }),
       jsx('rect', { x: 4, y: 20, width: 14, height: 4, fill: '#c9d0da' }),
@@ -3881,6 +4575,14 @@ function tickOfficeLife(now, roster, jobs, activeProfile, turnBusy, roomEl) {
   for (const [name, walk] of Object.entries($walks.get())) {
     if (walk.kind === 'visit' && !available.includes(name)) startWalkHome(name, roomEl)
   }
+  // Thinking/working bots belong at their desks: walk anyone who wandered off back home.
+  const players = new Set($game.get()?.players || [])
+  const drag = $drag.get()
+  for (const name of Object.keys($seats.get())) {
+    if (available.includes(name) || players.has(name) || drag?.name === name || $walks.get()[name]) continue
+    clearRoam(name)
+    startWalkHome(name, roomEl)
+  }
   if (incident) {
     const lastPhase = OFFICE_INCIDENTS[incident.kind].lines.length - 1
     const phase = Math.min(lastPhase, Math.floor((now - incident.at) / 4000))
@@ -3947,7 +4649,10 @@ function OfficeBoss() {
 }
 
 function PropArt({ id }) {
-  // Small physical props share the room's existing paper-doll construction.
+  // Small physical props share the room's existing paper-doll construction; a
+  // world folder can replace any of them with an image.
+  const art = useValue($worldArt).props[id]
+  if (art) return jsx('span', { className: `office-object art-${id} is-image`, 'aria-hidden': true, children: jsx('img', { src: art, alt: '', draggable: false }) })
   return jsxs('span', { className: `office-object art-${id}`, 'aria-hidden': true, children: [jsx('i', {}), jsx('b', {}), jsx('em', {}), jsx('small', {})] })
 }
 
@@ -4009,6 +4714,89 @@ function OfficeLifeScene({ roster, jobs, activeProfile, turnBusy, roomRef }) {
   ] })
 }
 
+// One agent: pick its character set and color. The choice is stored, not tied to the agent's name.
+function SpriteAssignRow({ bot }) {
+  const sets = useValue($botSprites)
+  useValue($spriteAssign)
+  const worldSetId = useValue($spriteWorld).split('/')[0]
+  const choice = spriteChoice(bot.name)
+  const look = botLook(bot)
+  if (!choice) return jsx('p', { children: `${look.title}: no character sets found.` })
+  const idle = look.images?.idle
+
+  return jsxs('div', { className: 'office-sprite-assign', children: [
+    idle ? jsx('img', { src: idle, alt: '', draggable: false, className: 'office-sprite-preview' }) : jsx('span', { className: 'office-sprite-preview is-empty', 'aria-hidden': true }),
+    jsx('span', { className: 'office-sprite-assign-name', children: look.title }),
+    jsx('select', { 'aria-label': `${look.title} character`, value: choice.set.id, disabled: Boolean(sets[worldSetId]), onChange: e => assignSprite(bot.name, { set: e.target.value }), children: Object.values(sets).map(set => jsx('option', { value: set.id, children: set.name }, set.id)) }),
+    jsx('select', { 'aria-label': `${look.title} color`, value: choice.color.id, onChange: e => assignSprite(bot.name, { color: e.target.value }), children: Object.values(choice.set.colors).map(color => jsx('option', { value: color.id, children: color.label }, color.id)) })
+  ] })
+}
+
+// One mood slot: a preview of the sprite loaded for the agent's character and color.
+function SpriteRow({ bot, mood }) {
+  const src = botLook(bot).images?.[mood.id] || ''
+
+  return jsxs('div', { className: 'office-sprite-row', children: [
+    src
+      ? jsx('img', { src, alt: '', draggable: false, className: 'office-sprite-preview' })
+      : jsx('span', { className: 'office-sprite-preview is-empty', 'aria-hidden': true }),
+    jsx('span', { className: 'office-sprite-mood', children: mood.name }),
+    jsx('span', { className: 'office-sprite-state', children: src ? 'loaded' : 'not set' })
+  ] })
+}
+
+function formatDuration(ms) {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+function Logbook({ roster }) {
+  const entries = useValue($logbook)
+  const background = useValue($background)
+  const now = usePulse(1000)
+  const running = Object.entries(background)
+  const [agent, setAgent] = useState('')
+  const titles = Object.fromEntries(roster.map(bot => [bot.name, botLook(bot).title]))
+  const shown = entries.filter(e => !agent || e.agent === agent).slice().reverse()
+  const agents = [...new Set(entries.map(e => e.agent))]
+  const stats = { completed: 0, failed: 0, other: 0 }
+  for (const e of entries) {
+    if (agent && e.agent !== agent) continue
+    stats[e.state === 'completed' ? 'completed' : e.state === 'failed' ? 'failed' : 'other'] += 1
+  }
+  let lastDay = ''
+  const rows = []
+  for (const e of shown) {
+    const day = new Date(e.at).toLocaleDateString(undefined, { dateStyle: 'full' })
+    if (day !== lastDay) {
+      rows.push(jsx('li', { className: 'office-log-day', children: day }, `day-${day}`))
+      lastDay = day
+    }
+    const tools = Object.entries(e.tools || {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, c]) => `${n}${c > 1 ? ` ×${c}` : ''}`).join(', ')
+    rows.push(jsxs('li', { className: cn('office-log-entry', `is-${e.state}`), children: [
+      jsxs('div', { className: 'office-log-head', children: [
+        jsx('time', { dateTime: new Date(e.at).toISOString(), children: new Date(e.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }),
+        jsx('strong', { children: titles[e.agent] || e.agent }),
+        jsx('span', { className: 'office-log-state', children: e.state === 'completed' ? 'done' : e.state === 'failed' ? 'failed' : 'unclear' }),
+        e.durationMs ? jsx('span', { className: 'office-log-meta', children: formatDuration(e.durationMs) }) : null,
+        e.toolCount ? jsx('span', { className: 'office-log-meta', children: `${e.toolCount} tool call${e.toolCount === 1 ? '' : 's'}` }) : null
+      ] }),
+      e.task ? jsx('p', { className: 'office-log-task', children: `Task: ${e.task}` }) : null,
+      e.summary ? jsx('p', { children: `Result: ${e.summary}` }) : null,
+      e.error ? jsx('p', { className: 'office-log-error', children: `Error: ${e.error}` }) : null,
+      tools ? jsx('p', { className: 'office-log-meta', children: `Tools: ${tools}` }) : null
+    ] }, e.id || `${e.at}-${e.agent}`))
+  }
+  return jsxs('article', { className: 'office-newspaper office-logbook', children: [
+    jsx('h2', { children: 'Logbook' }),
+    running.length ? jsxs('div', { className: 'office-log-running', children: [jsx('strong', { children: 'Running in the background' }), ...running.map(([name, bg]) => jsxs('p', { children: [`${titles[name] || name}: ${bg.activity === 'peek' ? `using ${bg.tool || 'tools'}` : bg.activity === 'think' ? 'thinking' : 'waiting for the model'} · ${formatDuration(Math.max(0, now - bg.since))}`, bg.count > 1 ? ` · ${bg.count} sessions` : ''] }, name))] }) : null,
+    jsxs('p', { className: 'office-paper-date', children: [`${stats.completed} done · ${stats.failed} failed · ${stats.other} unclear `, jsxs('select', { value: agent, onChange: e => setAgent(e.target.value), 'aria-label': 'Filter by agent', children: [jsx('option', { value: '', children: 'All agents' }), ...agents.map(a => jsx('option', { value: a, children: titles[a] || a }, a))] })] }),
+    rows.length ? jsx('ol', { children: rows }) : jsx('p', { children: 'No entries yet. Every finished, failed or unresolved task is recorded here.' })
+  ] })
+}
+
 function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
   const life = useValue($officeLife)
   const incident = useValue($officeIncident)
@@ -4016,6 +4804,14 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
   const arrange = useValue($officeArrange)
   const [panel, setPanel] = useState(null)
   const [story, setStory] = useState(null)
+  const [spriteBot, setSpriteBot] = useState(null)
+  const spriteStatus = useValue($spriteStatus)
+  useValue($botSprites)
+  useValue($characterWorlds)
+  useValue($spriteAssign)
+  const spriteMode = useValue($spriteMode)
+  const sets = useValue($botSprites)
+  const spriteBackground = useValue($spriteWorld)
   const now = usePulse(500)
   const total = Object.values(trophies).reduce((a, b) => a + b, 0)
   const week = useValue($week)
@@ -4047,6 +4843,8 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
       action('Furnish', () => toggle('furnish'), { 'aria-expanded': panel === 'furnish' }),
       arrange ? action('Finish arranging', () => $officeArrange.set(false)) : null,
       action('Personalities', () => toggle('people'), { 'aria-expanded': panel === 'people' }),
+      action('Sprites', () => toggle('sprites'), { 'aria-expanded': panel === 'sprites' }),
+      action('Logbook', () => toggle('log'), { 'aria-expanded': panel === 'log' }),
       action('Office newspaper', () => toggle('paper'), { 'aria-expanded': panel === 'paper' }),
       jsxs('label', { className: 'office-chaos', children: ['Office energy ', jsxs('select', { value: life.chaos, onChange: e => { saveOfficeLife({ ...life, chaos: e.target.value }); officeNextIncident = 0 }, children: [jsx('option', { value: 'quiet', children: 'Quiet' }), jsx('option', { value: 'gentle', children: 'A little odd' }), jsx('option', { value: 'chaos', children: 'Chaos' })] })] })
     ] }),
@@ -4056,6 +4854,51 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
       panel === 'toys' ? jsxs(Fragment, { children: [jsx('h2', { children: 'For research purposes.' }), jsx('p', { children: 'Short office scenes. Busy bots keep working.' }), jsx('div', { className: 'office-toy-list', children: Object.entries({ mouse: 'Release wind-up mouse', ice: 'Ice the carpet', ball: 'Drop beach ball', lunch: 'Ring lunch bell', gravity: 'Switch off gravity', printer: 'Provoke printer', delivery: 'Order enormous plant', ufo: 'Invite tiny UFO', boss: 'Call the boss' }).map(([id, label]) => action(label, () => { if (beginOfficeIncident(id, roster, jobs, activeProfile, turnBusy, roomRef.current)) setPanel(null) }, { disabled: Boolean(incident) })) })] }) : null,
       panel === 'furnish' ? jsxs(Fragment, { children: [jsx('h2', { children: 'Make yourself at home.' }), jsx('p', { children: `${total} completed task${total === 1 ? '' : 's'}. Keepsakes unlock as real work gets delivered.` }), action(arrange ? 'Finish arranging' : 'Arrange furniture', () => { $officeArrange.set(!arrange); if (!arrange) setPanel(null) }, { 'aria-pressed': arrange }), arrange ? jsx('p', { children: 'Drag an object on the carpet, or focus it and use the arrow keys.' }) : null, jsx('div', { className: 'office-furniture-list', children: OFFICE_FURNITURE.map(p => { const visible = life.props[p.id]?.visible ?? p.unlock === 0; return action(`${visible ? 'Put away' : 'Place'} ${p.name}${total < p.unlock && !visible ? ` · ${p.unlock} tasks` : ''}`, () => saveOfficeLife({ ...life, props: { ...life.props, [p.id]: { ...officePropPosition(p.id), visible: !visible } } }), { disabled: !visible && total < p.unlock }) }) })] }) : null,
       panel === 'people' ? jsxs(Fragment, { children: [jsx('h2', { children: 'Every desk has a character.' }), jsx('p', { children: 'Quirks change desk objects, idle habits, reactions, and celebrations.' }), ...roster.map(bot => jsxs('label', { className: 'office-personality-row', children: [jsx('span', { children: botLook(bot).title }), jsxs('select', { value: officeQuirk(bot.name, life).id, onChange: e => saveOfficeLife({ ...life, quirks: { ...life.quirks, [bot.name]: e.target.value } }), children: OFFICE_QUIRKS.map(q => jsx('option', { value: q.id, children: q.name }, q.id)) })] }, bot.name))] }) : null,
+      panel === 'sprites' ? jsxs(Fragment, { children: [
+        jsx('button', { type: 'button', className: 'office-panel-folder', title: 'Open plugin folder', 'aria-label': 'Open plugin folder', onClick: () => void openPluginFolder(), children: jsx('svg', { viewBox: '0 0 24 24', width: 16, height: 16, 'aria-hidden': true, children: jsx('path', { d: 'M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 8.7v9.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinejoin: 'round' }) }) }),
+        jsx('h2', { children: 'Agent look.' }),
+        jsx('div', { className: 'office-look-radios', role: 'radiogroup', 'aria-label': 'Agent look', children: [
+          ['icons', 'Plugin default icons'],
+          ['avatars', 'Hermes agent avatars'],
+          ['sprites', 'Sprite GIFs (characters)']
+        ].map(([id, label]) => jsxs('label', { className: 'office-look-radio', children: [
+          jsx('input', { type: 'radio', name: 'office-look', value: id, checked: spriteMode === id, onChange: () => setSpriteMode(id) }),
+          ' ',
+          label
+        ] }, id)) }),
+        ...(spriteMode !== 'sprites' ? [] : [
+        jsxs('label', { className: 'office-sprite-bot-pick', children: [
+          'World ',
+          jsxs('select', {
+            value: findWorld(spriteBackground) ? spriteBackground : '',
+            onChange: e => setSpriteWorld(e.target.value),
+            children: [
+              jsx('option', { value: '', children: 'Default' }),
+              ...listWorlds().map(w => jsx('option', { value: w.id, children: w.label }, w.id))
+            ]
+          }),
+          ' ',
+          action('Reload sprites', () => void loadSpriteConfig())
+        ] }),
+        jsx('h2', { children: 'Characters & colors.' }),
+        jsx('p', { children: 'Character sets live in the characters/ folder next to the plugin: one sub-folder per set (for example characters/bots) with its own sprites.json and files named <color>_<mood>.gif. Copy a new set folder in and press Reload. Choosing a World automatically uses that world\u2019s character set for every agent when the matching set is available; their color choices are retained where possible. With Default selected, pick a character and a color for every agent below; the color also sets the agent\u2019s accent. Idle covers any mood left out. Walkfront/walkback are used while moving; agents wait for the movement sprite to load before they start. Square GIF/PNG, around 128\u2013512px with a transparent background.' }),
+        spriteStatus ? jsx('p', { className: 'office-sprite-status', children: spriteStatus }) : null,
+        ...roster.map(bot => jsx(SpriteAssignRow, { bot }, bot.name)),
+        jsxs('label', { className: 'office-sprite-bot-pick', children: [
+          'Preview ',
+          jsxs('select', {
+            value: roster.some(bot => bot.name === spriteBot) ? spriteBot : roster[0]?.name || '',
+            onChange: e => setSpriteBot(e.target.value),
+            children: roster.map(bot => jsx('option', { value: bot.name, children: botLook(bot).title }, bot.name))
+          })
+        ] }),
+        ...(() => {
+          const bot = roster.find(row => row.name === spriteBot) || roster[0]
+          return bot ? SPRITE_MOODS.map(mood => jsx(SpriteRow, { bot, mood }, mood.id)) : [jsx('p', { children: 'No agents yet.' })]
+        })()
+        ])
+      ] }) : null,
+      panel === 'log' ? jsx(Logbook, { roster }) : null,
       panel === 'paper' ? jsxs('article', { className: 'office-newspaper', children: [jsx('h2', { children: 'The Carpet Chronicle' }), jsx('p', { className: 'office-paper-date', children: new Date(now).toLocaleDateString(undefined, { dateStyle: 'full' }) }), jsx('p', { children: week && week.start === weekStart(new Date(now)) ? weekLine(week) || 'A quiet week on the carpet.' : 'A fresh week on the carpet.' }), story ? jsxs('div', { className: 'office-memory', children: [jsx('strong', { children: story.scene ? OFFICE_INCIDENTS[story.scene].title : 'From the office records' }), jsx('p', { children: story.text }), jsx('div', { className: 'office-memory-scene', 'aria-label': 'Saved furniture arrangement', children: (story.snapshot || []).map(p => jsx('span', { style: { position: 'absolute', left: `${p.x}%`, top: `${(p.y - 45) * 1.5}%` }, children: jsx(PropArt, { id: p.id }) }, p.id)) }), jsx('p', { children: story.cast.length ? `Present: ${story.cast.join(', ')}` : 'An office-wide incident.' }), action('Close memory', () => setStory(null))] }) : null, life.stories.length ? jsx('ol', { children: [...life.stories].reverse().map((s, i) => jsx('li', { children: jsxs('button', { type: 'button', onClick: () => setStory(s), children: [jsx('time', { dateTime: new Date(s.at).toISOString(), children: new Date(s.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }), ' ', s.text] }) }, `${s.at}-${i}`)) }) : jsx('p', { children: 'No headlines yet. Finish a task or open the toy drawer to give the editor something to print.' })] }) : null
     ] }) : null
   ] })
@@ -4066,7 +4909,17 @@ function OfficeFloor() {
   const turnBusy = useTurnBusy()
   const activeProfile = (useValue(focusedProfileState) || 'default').trim() || 'default'
   useValue($avatars)
-  const jobs = useValue($jobs)
+  useValue($botSprites)
+  useValue($spriteAssign)
+  useValue($spriteMode)
+  const ownJobs = useValue($jobs)
+  const background = useValue($background)
+  const mergeRef = useRef({ own: null, bg: null, out: null })
+  if (mergeRef.current.own !== ownJobs || mergeRef.current.bg !== background) {
+    mergeRef.current = { own: ownJobs, bg: background, out: withBackgroundJobs(ownJobs, background) }
+  }
+  const jobs = mergeRef.current.out
+  useValue($agentActivity)
   const hasTransientWork = Object.values(jobs).some(row => row && (row.state === JOB_STATES.SUBMITTING || row.state === JOB_STATES.RUNNING))
   const now = usePulse(hasTransientWork ? 200 : 1000)
   const night = isNightHour(new Date(now))
@@ -4100,11 +4953,13 @@ function OfficeFloor() {
   // the stored id is durable, so the fallback poll can reacquire liveness after
   // a plugin reload without ever resubmitting the prompt.
   useEffect(() => {
-    for (const [name, row] of Object.entries(jobs)) {
+    for (const [name, row] of Object.entries(ownJobs)) {
       if (!jobIsActive(row) || jobPollers.has(name) || !row.storedSessionId) continue
       watchJob(name, row.id)
     }
-  }, [jobs])
+  }, [ownJobs])
+
+  useEffect(() => { pruneBackground(now) }, [now])
 
   useEffect(() => {
     tickRoam(now, roomRef.current, { jobs, rosterNames: roster.map(bot => bot.name) })
@@ -4212,7 +5067,7 @@ function OfficeFloor() {
   }
 
   return jsxs('div', {
-    className: cn('office-root', night && 'is-night', `is-${backdrop}`),
+    className: cn('office-root', 'is-worlds', night && 'is-night', `is-${backdrop}`),
     children: [
       jsxs('header', {
         className: 'office-header',
@@ -4343,6 +5198,7 @@ function OfficeFloor() {
                                     turnBusy,
                                     tasked: jobIsActive(jobs[bot.name]),
                                     taskState: jobs[bot.name]?.state,
+                                    taskActivity: activityForAgent(bot.name, jobs),
                                     picked: bot.name === selected,
                                     roomRef,
                                     night,
@@ -4384,10 +5240,9 @@ function OfficeChip() {
   const turnBusy = useTurnBusy()
   const activeProfile = (useValue(focusedProfileState) || 'default').trim() || 'default'
   const roster = Array.isArray(data?.profiles) ? data.profiles : []
-  const jobs = useValue($jobs)
-  const thinking = roster.some(
-    bot => deskMood({ isActive: bot.name === activeProfile, turnBusy, tasked: jobIsActive(jobs[bot.name]) }) === 'think'
-  )
+  const jobs = withBackgroundJobs(useValue($jobs), useValue($background))
+  useValue($agentActivity)
+  const thinking = roster.some(bot => activityForAgent(bot.name, jobs) === 'think')
 
   return jsx(Tip, {
     label: thinking ? 'A bot is thinking on the office floor' : 'Open the office',
@@ -4439,14 +5294,16 @@ function injectOfficeCss() {
 .office-plane { position:absolute; margin:-8px 0 0 -12px; transform-origin:50% 50%; animation: office-plane .8s cubic-bezier(.3,.6,.4,1) forwards; filter: drop-shadow(0 2px 2px rgba(0,0,0,.25)); }
 .office-confetti { position:absolute; left:50%; top:60px; width:0; height:0; z-index:9; pointer-events:none; }
 .office-confetti i { position:absolute; left:-3px; top:-3px; width:6px; height:6px; border-radius:1px; background: hsl(calc(var(--i) * 51deg), 85%, 60%); animation: office-confetti .95s cubic-bezier(.2,.7,.4,1) forwards; --ang: calc(var(--i) * 51deg - 150deg); }
-.office-stars { margin-left:6px; color:#d9a422; font-weight:600; }
+.office-tag .office-stars { margin-left:3px; color:#d9a422; font-weight:600; }
 .office-note { position:absolute; font-size:14px; color:CanvasText; text-shadow: 0 0 2px Canvas, 0 0 6px Canvas; animation: office-note 1.8s ease-in-out infinite; animation-delay: var(--d, 0s); opacity:0; }
 .office-ding { position:absolute; top:22px; left:50%; transform:translateX(-50%); font-size:11px; font-weight:700; color:#c9302c; padding:1px 8px; border-radius:99px; animation: office-ding 1.4s ease-out forwards; z-index:4; }
-.office-eom { position:absolute; left:24%; top:6px; z-index:1; display:grid; justify-items:center; gap:2px; transform-origin:50% 0; animation: office-eom-hang .9s cubic-bezier(.3,1.4,.4,1) 1; }
-.office-eom-frame { width:44px; height:44px; box-sizing:border-box; padding:4px; border-radius:4px; background:linear-gradient(135deg, #f0d27a, #b8892c 45%, #f2d98a 55%, #a87a20); box-shadow: 0 2px 4px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.4); }
-.office-eom-frame .office-face { width:36px; height:36px; background:#f7f2e4; border-radius:3px; }
-.office-eom-plate { font-size:7px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:#3a2a10; background:linear-gradient(180deg, #e8c86a, #c9a03a); padding:1px 5px; border-radius:2px; box-shadow: 0 1px 0 rgba(0,0,0,.3); white-space:nowrap; }
-.office-eom-name { font-size:9px; font-weight:600; color:CanvasText; background:Canvas; padding:0 6px; border-radius:99px; box-shadow: var(--office-chip-shadow); max-width:90px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.office-eom { position:absolute; left:56%; top:2px; z-index:1; display:flex; align-items:center; transform-origin:50% 0; animation: office-eom-hang .9s cubic-bezier(.3,1.4,.4,1) 1; }
+.office-eom-award { position:relative; display:grid; justify-items:center; gap:2px; }
+.office-eom-frame { width:64px; height:64px; box-sizing:border-box; padding:6px; border-radius:6px; background:linear-gradient(135deg, #f0d27a, #b8892c 45%, #f2d98a 55%, #a87a20); box-shadow: 0 2px 4px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.4); }
+.office-eom-frame .office-face { position:relative; left:-4px; top:-4px; width:72px; height:72px; background:transparent; border-radius:0; object-fit:contain; }
+.office-eom-frame .office-face.is-sprite { transform:none; }
+.office-eom-plate { font-size:10px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:#3a2a10; background:linear-gradient(180deg, #e8c86a, #c9a03a); padding:2px 8px; border-radius:3px; box-shadow: 0 1px 0 rgba(0,0,0,.3); white-space:nowrap; }
+.office-eom-name { position:absolute; left:calc(50% + 40px); top:51px; transform:translateY(-50%); font-size:16px; font-weight:700; color:CanvasText; max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .office-tally { position:absolute; top:14px; left:50%; transform:translateX(-50%); font-size:10px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; padding:2px 8px; border-radius:99px; z-index:1; }
 .office-butterfly { position:absolute; z-index:6; pointer-events:none; }
 .office-butterfly.is-a { left:30%; top:40%; animation: office-fly-a 16s ease-in-out infinite; }
@@ -4506,7 +5363,7 @@ function injectOfficeCss() {
 }
 .office-task-send { height:32px; padding:0 12px; border:0; border-radius:var(--office-radius); background:var(--ui-accent); color:var(--ui-accent-fg, #fff); font-size:12px; cursor:pointer; }
 .office-task-send:disabled { opacity:.45; cursor:default; }
-.office-desk.is-picked .office-plate { outline:1px dashed var(--ui-accent); outline-offset:1px; }
+.office-desk.is-picked .office-tag { outline:1px dashed var(--ui-accent); outline-offset:1px; }
 .office-room { position:relative; flex:1 1 auto; max-height:min(100%, 780px); min-height:0; margin:0 12px; overflow:auto; border:1px solid var(--ui-stroke-secondary); border-radius:12px; background:#557b8c; }
 .office-wall { position:absolute; inset:0 0 auto 0; height:${WALL_H}px; pointer-events:none; }
 .office-wall:after { content:""; position:absolute; left:0; right:0; top:100%; height:12px; background:linear-gradient(180deg, rgba(0,0,0,.34), rgba(0,0,0,0)); }
@@ -4554,9 +5411,11 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-slice { position:absolute; top:-2px; left:-12px; z-index:2; transform:rotate(-20deg); filter:drop-shadow(0 1px 1px rgba(0,0,0,.35)); animation:office-slice .6s ease-in-out infinite; }
 .office-status.is-sad { color:#c9302c; }
 .office-person.has-pizza .office-face { animation: office-chew .55s ease-in-out infinite; }
+.office-person.has-pizza .office-face.is-sprite { animation: office-chew-sprite .55s ease-in-out infinite; }
 .office-whisper.is-hi { color:var(--ui-accent); font-weight:600; animation: office-hi .3s ease-out 1; }
 @keyframes office-hi { 0% { transform: translateY(4px) scale(.7); opacity:0; } 100% { transform: none; opacity:1; } }
 @keyframes office-slice { 0%,100% { transform:rotate(-20deg) translateY(0); } 50% { transform:rotate(-8deg) translateY(-2px); } }
+@keyframes office-chew-sprite { 0%,100% { scale:1 1; rotate:0deg; } 50% { scale:1.06 1; rotate:-3deg; } }
 .office-game-layer { position:absolute; inset:0; pointer-events:none; z-index:4; }
 .office-game-chair { position:absolute; display:block; filter:drop-shadow(0 2px 2px rgba(0,0,0,.35)); }
 .office-game-chair.is-claimed { filter:drop-shadow(0 2px 2px rgba(0,0,0,.35)) drop-shadow(0 0 4px var(--ui-accent)); }
@@ -4572,17 +5431,23 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-lamp-base { width:9px; height:3px; margin-top:-1px; border-radius:2px 2px 1px 1px; background:#4a3b2e; box-shadow:0 1px 0 #2a2118; }
 .office-monitor { position:relative; z-index:2; display:flex; flex-direction:column; align-items:center; width:62px; margin-top:2px; pointer-events:none; }
 .office-monitor-head { position:relative; width:58px; height:40px; padding:5px 5px 8px; border-radius:5px 5px 3px 3px; background:linear-gradient(180deg, #55575d, #2c2e33); box-shadow: inset 0 1px 0 #7a7c82, 0 1px 0 #1a1b1e, 0 2px 4px color-mix(in srgb, #000 28%, transparent); }
-.office-screen { width:100%; height:100%; border-radius:2px; background:#121316; box-shadow: inset 0 0 0 1px #0a0a0c; overflow:hidden; }
+.office-screen { position:relative; width:100%; height:100%; border-radius:2px; background:#121316; box-shadow: inset 0 0 0 1px #0a0a0c; overflow:hidden; }
 .office-screen.is-on { background:linear-gradient(180deg, color-mix(in srgb, var(--ui-accent) 70%, #1a1a22), #121316); animation:office-glow 1.1s ease-in-out infinite; }
-.office-screen-copy { height:100%; overflow:hidden; padding:2px 3px 1px; font-size:5.5px; line-height:1.25; letter-spacing:0; color:#c9d4c4; text-align:left; word-break:break-word; }
+.office-screen-copy { position:relative; height:100%; overflow:hidden; padding:2px 3px 1px; font-size:5.5px; line-height:1.25; letter-spacing:0; color:#c9d4c4; text-align:left; word-break:break-word; }
 .office-screen.is-on .office-screen-copy { color:#eef2ff; }
+.office-screen-run { position:absolute; inset:0; overflow:hidden; opacity:.5; }
+.office-screen-run-lines { display:flex; flex-direction:column; gap:2px; padding:2px 3px; animation:office-screen-scroll 2.4s linear infinite; }
+.office-screen-run-lines i { display:block; height:2px; border-radius:1px; background:#cfe3ff; flex:none; }
+.office-screen-run-lines i:nth-child(12n+2), .office-screen-run-lines i:nth-child(12n+6), .office-screen-run-lines i:nth-child(12n+10) { background:#9fe6b4; }
+.office-screen-run-lines i:nth-child(12n+4), .office-screen-run-lines i:nth-child(12n+9) { background:#ffd9a0; }
+@keyframes office-screen-scroll { from { transform:translateY(0); } to { transform:translateY(-50%); } }
 .office-monitor-cam { position:absolute; left:50%; bottom:2.5px; width:3px; height:3px; margin-left:-1.5px; border-radius:99px; background:#141416; box-shadow:0 0 0 1px #4a4c52; }
 .office-monitor-neck { width:7px; height:7px; background:linear-gradient(180deg, #3e4046, #2a2c30); }
 .office-monitor-base { width:24px; height:4px; border-radius:3px 3px 1px 1px; background:linear-gradient(180deg, #45474d, #2a2c30); box-shadow:0 1px 1px color-mix(in srgb, #000 30%, transparent); }
 .office-seat { position:relative; width:42px; height:46px; margin-top:-8px; z-index:3; }
 .office-desk-chair { position:absolute; left:0; top:0; display:block; transform-origin:50% 90%; filter:drop-shadow(0 2px 2px rgba(0,0,0,.3)); }
 .office-desk-chair.is-wobble { animation:office-wobble .5s ease-in-out 2; }
-.office-stage .office-person { position:absolute; left:0; top:-2px; margin:0; z-index:3; width:42px; }
+.office-stage .office-person { position:absolute; left:0; top:28px; margin:0; z-index:3; width:42px; }
 .office-stage .office-person .office-status { position:absolute; top:100%; left:50%; transform:translateX(-50%); margin-top:2px; }
 .office-stage .office-person .office-hearts { left:50%; transform:translateX(-50%); }
 .office-person { position:relative; z-index:3; margin-top:4px; display:grid; justify-items:center; gap:4px; cursor:grab; touch-action:none; outline:none; }
@@ -4605,6 +5470,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-stage .office-person.is-closer, .office-stage .office-person.is-held { animation: none; }
 .office-ground { position:absolute; left:50%; bottom:-3px; width:30px; height:9px; margin-left:-15px; border-radius:50%; background: radial-gradient(ellipse at 50% 50%, rgba(0,0,0,.36), rgba(0,0,0,0) 70%); transform: scale(calc(1 - var(--lift, 0) * .5)); opacity: calc(1 - var(--lift, 0) * .55); z-index:-1; pointer-events:none; }
 .office-person.is-drop .office-face { animation: office-drop .46s cubic-bezier(.2,.9,.3,1.2) 1; }
+.office-person.is-drop .office-face.is-sprite { animation: office-drop-sprite .46s cubic-bezier(.2,.9,.3,1.2) 1; }
 .office-puff-layer { position:absolute; inset:0; pointer-events:none; z-index:7; }
 .office-puff { position:absolute; width:22px; height:10px; margin:-5px 0 0 -11px; border-radius:50%; border:2px solid rgba(255,255,255,.75); box-shadow: 0 0 0 1px rgba(0,0,0,.18), inset 0 0 0 1px rgba(0,0,0,.12); animation: office-puff .5s ease-out forwards; }
 .office-puff:before, .office-puff:after { content:""; position:absolute; top:-2px; width:4px; height:4px; border-radius:99px; background:rgba(255,255,255,.85); box-shadow: 0 0 0 1px rgba(0,0,0,.18); animation: office-puff-dot .5s ease-out forwards; }
@@ -4620,21 +5486,23 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-face-clap { animation:office-pet 0.28s ease-in-out infinite; }
 .office-face-stretch { transform: scaleX(1.18) scaleY(0.9); }
 .office-face-peek { transform: translateY(-6px); }
+/* Sprite images (animated GIFs) carry their own motion: no bobbing, tilting or scaling on top. */
+.office-face.is-sprite { animation:none; transform:scale(2.73); transform-origin:50% 100%; pointer-events:auto !important; cursor:inherit; }
+.office-stage .office-person:has(.office-face.is-sprite) { animation:none; }
 .office-status { font-size:10px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--ui-accent); padding:1px 7px; border-radius:99px; white-space:nowrap; }
 .office-status.is-idle { color:color-mix(in srgb, CanvasText 62%, transparent); }
 .office-person.is-shy .office-status, .office-person.is-held .office-status { color:#f09; }
 .office-whisper { position:absolute; top:-14px; right:-6px; font-size:12px; color:CanvasText; background:Canvas; border-radius:8px; padding:0 5px; box-shadow: 0 0 0 1px color-mix(in srgb, CanvasText 18%, transparent); }
-.office-plate { position:relative; z-index:2; width:100%; padding:6px 8px 7px; border:0; border-radius:var(--office-radius); background:Canvas; color:CanvasText; text-align:center; cursor:pointer; box-shadow: var(--office-card-shadow); }
-.office-plate:hover { box-shadow: 0 0 0 1px var(--ui-accent), 0 1px 0 rgba(0,0,0,.08), 0 5px 12px rgba(0,0,0,.16); }
-.office-name { font-size:13px; font-weight:600; color:CanvasText; }
-.office-handle { font-size:11px; color:color-mix(in srgb, CanvasText 60%, transparent); }
+.office-tag { position:absolute; z-index:5; top:auto; bottom:calc(100% - 1px); left:50%; transform:translateX(-50%); max-width:calc(100% - 4px); margin:0; padding:1px 6px; border:0; border-radius:99px; background:Canvas; color:CanvasText; box-shadow: var(--office-chip-shadow); font-size:12px; font-weight:800; line-height:1.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+.office-tag:hover { color:var(--ui-accent); }
 .office-say { position:relative; z-index:2; width:100%; margin-top:2px; padding:8px 10px 9px; border:0; border-radius:var(--office-radius); background:Canvas; color:CanvasText; font:inherit; font-size:12px; line-height:1.35; text-align:left; cursor:pointer; display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; box-shadow: var(--office-card-shadow); }
 .office-say:before { content:""; position:absolute; left:50%; top:-5px; width:9px; height:9px; margin-left:-4.5px; background:Canvas; border-left:1px solid var(--ui-stroke-secondary); border-top:1px solid var(--ui-stroke-secondary); transform:rotate(45deg); }
 .office-say:hover { outline-color:var(--ui-accent); }
 .office-home { margin-top:2px; border:0; padding:2px 9px; border-radius:99px; color:color-mix(in srgb, CanvasText 72%, transparent); font:inherit; font-size:10px; cursor:pointer; }
 .office-home:hover { color:var(--ui-accent); }
-.office-desk.is-active .office-plate { box-shadow: 0 0 0 1.5px var(--ui-accent), 0 1px 0 rgba(0,0,0,.08), 0 5px 12px rgba(0,0,0,.16); }
-.office-desk.is-think .office-desk-top { box-shadow:0 7px 0 #5a3d22, 0 8px 0 color-mix(in srgb, var(--ui-accent) 35%, transparent); }
+.office-desk.is-active .office-tag { color:var(--ui-accent); }
+.office-desk.is-think .office-desk-top, .office-desk.is-peek .office-desk-top { box-shadow:0 7px 0 #5a3d22, 0 8px 0 color-mix(in srgb, var(--ui-accent) 35%, transparent); }
+.office-desk.is-peek .office-status { color:var(--ui-accent); }
 .office-hearts { position:absolute; top:-10px; left:50%; display:flex; gap:4px; pointer-events:none; }
 .office-hearts span { color:#f48; font-size:11px; animation:office-heart 0.9s ease-out forwards; }
 .office-hearts span:nth-child(2) { animation-delay:.08s; }
@@ -4655,6 +5523,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 @keyframes office-plane { 0% { transform: translate(0, 0) rotate(var(--rot)) scale(.8); opacity:0; } 12% { opacity:1; } 100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(.6); opacity:0; } }
 @keyframes office-confetti { 0% { transform: translate(0, 0) rotate(0); opacity:1; } 60% { opacity:1; } 100% { transform: translate(calc(cos(var(--ang)) * 34px), calc(sin(var(--ang)) * 26px + 30px)) rotate(240deg); opacity:0; } }
 @keyframes office-note { 0% { transform: translateY(6px) rotate(-8deg); opacity:0; } 25% { opacity:1; } 100% { transform: translateY(-26px) rotate(10deg); opacity:0; } }
+@keyframes office-drop-sprite { 0% { translate:0 0; } 40% { translate:0 -3px; } 70% { translate:0 1px; } 100% { translate:0 0; } }
 @keyframes office-ding { 0% { transform: translate(-50%, 8px) scale(.6); opacity:0; } 20% { transform: translate(-50%, 0) scale(1.1); opacity:1; } 70% { opacity:1; } 100% { transform: translate(-50%, -6px); opacity:0; } }
 @keyframes office-fly-a { 0% { transform: translate(0, 0); } 25% { transform: translate(120px, -30px); } 50% { transform: translate(60px, 60px); } 75% { transform: translate(-80px, 20px); } 100% { transform: translate(0, 0); } }
 @keyframes office-fly-b { 0% { transform: translate(0, 0); } 30% { transform: translate(-90px, 40px); } 60% { transform: translate(40px, 80px); } 100% { transform: translate(0, 0); } }
@@ -4682,7 +5551,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 @keyframes office-puff-dot { 0% { transform: translate(0, 0); opacity:1; } 100% { transform: translate(var(--dx), -10px); opacity:0; } }
 @keyframes office-boot { 0% { filter: brightness(3) contrast(1.4); } 30% { filter: brightness(.6); } 60% { filter: brightness(2); } 100% { filter: brightness(1); } }
 @media (prefers-reduced-motion: reduce) {
-  .office-stage .office-person, .office-blink, .office-gaze, .office-face-think .office-eyes, .office-face-think .office-eye-l, .office-face-think .office-eye-r, .office-face-think, .office-face-pet, .office-face-clap, .office-face-shy, .office-screen.is-on, .office-slice, .office-plant, .office-desk-chair.is-wobble, .office-person.is-drop .office-face, .office-butterfly, .office-wing, .office-sweep, .office-oven-fire, .office-bubble, .office-pendant, .office-person.has-pizza .office-face, .office-note, .office-doodle-line, .office-hint, .office-news, .office-confetti, .office-confetti i { animation: none !important; }
+  .office-stage .office-person, .office-blink, .office-gaze, .office-face-think .office-eyes, .office-face-think .office-eye-l, .office-face-think .office-eye-r, .office-face-think, .office-face-pet, .office-face-clap, .office-face-shy, .office-screen.is-on, .office-screen-run-lines, .office-slice, .office-plant, .office-desk-chair.is-wobble, .office-person.is-drop .office-face, .office-butterfly, .office-wing, .office-sweep, .office-oven-fire, .office-bubble, .office-pendant, .office-person.has-pizza .office-face, .office-note, .office-doodle-line, .office-hint, .office-news, .office-confetti, .office-confetti i { animation: none !important; }
   .office-confetti { display:none !important; }
   .office-status.is-quiet { animation: none; opacity:.35; }
   .office-eom { animation: none; }
@@ -4695,8 +5564,22 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-title { font-size:24px; font-weight:750; letter-spacing:-.035em; }
 .office-head-right { flex-wrap:wrap; gap:10px; }
 .office-tool { border-radius:5px; height:30px; font-size:12px; color:CanvasText; }
-.office-room { margin:auto; width:min(calc(100% - 36px),1080px); box-sizing:border-box; flex:0 1 600px; max-height:100%; border-radius:10px; border-color:#756e5b; box-shadow:0 12px 30px #221b2038; min-height:300px; }
-.office-stage-wrap { padding:16px 0; }
+.office-room { margin:auto; width:min(calc(100% - 36px),1242px); box-sizing:border-box; flex:1 1 690px; max-height:min(100%, calc((100vh - 245px) * 0.9)); border-radius:10px; border-color:#756e5b; box-shadow:0 12px 30px #221b2038; min-height:162px; }
+.office-stage-wrap { padding:8px 0; }
+
+@media (max-height: 760px) {
+  .office-header { padding:8px 14px 6px; }
+  .office-stage-wrap { padding:3px 0; }
+  .office-room { min-height:135px; max-height:calc((100vh - 220px) * 0.9); }
+  .office-grid { gap:12px; padding:12px 14px 18px; }
+}
+
+@media (max-height: 600px) {
+  .office-title { font-size:20px; }
+  .office-life-toolbar { padding:5px 10px; }
+  .office-taskbar { padding:5px 10px; }
+  .office-room { min-height:108px; max-height:calc((100vh - 190px) * 0.9); }
+}
 .office-grid { grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:20px; padding:20px 20px 28px; }
 .office-window { right:8%; }
 .office-desk { background:transparent; box-shadow:none; border-radius:0; }
@@ -4710,7 +5593,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-noticeboard i,.office-noticeboard b { position:absolute; width:24px; height:27px; top:13px; left:9px; background:#f5e4a8; transform:rotate(-8deg); box-shadow:0 2px 2px #47332230; }
 .office-noticeboard b { left:46px; background:#d9e4df; transform:rotate(6deg); }
 .office-noticeboard span { display:block; font-size:7px; color:#382e20; text-align:center; margin-top:2px; font-weight:700; }
-.office-eom { left:auto; right:24%; transform:none; }
+.office-eom { left:56%; right:auto; transform:none; }
 .office-person > .office-face { position:relative; z-index:2; }
 .office-person .office-status { margin-top:1px; }
 .office-boss { position:absolute; width:42px; z-index:12; display:flex; flex-direction:column; align-items:center; pointer-events:none; }
@@ -4727,9 +5610,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-furniture[data-office-prop=coffee]:before { content:''; position:absolute; width:65px; height:28px; top:32px; background:#ac885f; border-top:5px solid #e1cbaa; border-bottom:5px solid #725d48; border-radius:2px; }
 .office-furniture[data-office-prop=coffee] .office-object { transform:translateY(-10px); }
 .office-floor { padding-bottom:158px; }
-.office-plate { background:#f5eddb; color:#38332a; border-radius:3px 3px 6px 6px; border-bottom:3px solid #b39b72; }
-.office-name { font-weight:750; color:#38332a; }
-.office-handle { color:#6b5d46; }
+.office-tag { background:#f5eddb; color:#573f22; box-shadow:0 1px 2px #2a1d0f40; }
 .office-say { font-size:11px; padding:8px; box-shadow:0 3px 7px #261f2526; }
 .office-desk-top { border-radius:5px; }
 .office-bar-sign { background:#994830; color:#fff8e6; border-radius:3px; padding:6px 12px; letter-spacing:.08em; transform:rotate(-3deg); }
@@ -4754,10 +5635,24 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-life-panel h2 { margin:0 45px 8px 0; font-size:19px; line-height:1.2; letter-spacing:-.025em; }
 .office-life-panel p { margin:8px 0 16px; font-size:12px; line-height:1.6; }
 .office-panel-close { float:right; font-size:11px; }
+.office-panel-folder { float:right; margin-right:6px; display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; padding:0; border:1px solid var(--ui-stroke-secondary,#c7bca9); border-radius:5px; background:Canvas; color:CanvasText; cursor:pointer; }
+.office-panel-folder:hover { background:color-mix(in srgb,CanvasText 7%,Canvas); }
 .office-toy-list,.office-furniture-list { display:flex; flex-wrap:wrap; gap:8px; }
 .office-personality-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px; font-size:13px; }
 .office-personality-row span { overflow-wrap:anywhere; min-width:0; }
 .office-personality-row select { max-width:65%; }
+.office-sprite-bot-pick { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px; }
+.office-sprite-assign { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; }
+.office-sprite-assign-name { flex:1; min-width:0; overflow-wrap:anywhere; }
+.office-sprite-assign select { max-width:32%; }
+.office-sprite-row { display:flex; align-items:center; gap:10px; margin-top:10px; font-size:12px; }
+.office-sprite-mood { flex:0 0 150px; overflow-wrap:anywhere; }
+.office-sprite-state { margin-left:auto; font-size:11px; color:color-mix(in srgb, CanvasText 60%, transparent); }
+.office-sprite-status { font-size:11px; overflow-wrap:anywhere; color:color-mix(in srgb, CanvasText 60%, transparent); }
+.office-look-radios { display:flex; flex-direction:column; gap:4px; margin:4px 0 10px; }
+.office-look-radio { display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; }
+.office-sprite-preview { flex:0 0 auto; width:42px; height:42px; border-radius:28%; object-fit:cover; background:color-mix(in srgb, CanvasText 10%, transparent); }
+.office-sprite-preview.is-empty { box-shadow: inset 0 0 0 1px color-mix(in srgb, CanvasText 25%, transparent); }
 .office-incident-caption { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:0 20px 10px; padding:10px 12px; background:var(--office-paper); color:var(--office-ink); border-radius:5px; font-size:12px; }
 .office-incident-caption strong { font-size:12px; }
 .office-incident-caption span { flex:1; min-width:160px; }
@@ -4767,6 +5662,16 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-newspaper li { border-top:1px solid #d7cdb8; }
 .office-newspaper li button { text-align:left; padding:10px 0; border:0; background:transparent; color:inherit; cursor:pointer; font:inherit; font-size:12px; line-height:1.5; }
 .office-newspaper time { font-size:10px; color:#6c604c; }
+.office-logbook li { padding:8px 0; font-size:12px; line-height:1.5; }
+.office-logbook .office-log-day { font-family:Georgia,serif; font-weight:700; border-top:3px double #8c8068; padding-top:10px; }
+.office-logbook p { margin:2px 0; overflow-wrap:anywhere; }
+.office-log-head { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; }
+.office-log-state { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:#3f6b3a; }
+.office-log-entry.is-failed .office-log-state, .office-log-error { color:#a33; }
+.office-log-entry.is-unknown .office-log-state { color:#8a6d1f; }
+.office-log-meta { font-size:10px; color:#6c604c; }
+.office-log-task { color:#4a4130; }
+.office-log-running { padding:8px 10px; margin-bottom:8px; background:#efe6cf; border-left:3px solid #3f6b3a; font-size:12px; }
 .office-memory { border-top:2px solid #8c8068; padding-top:12px; }
 .office-memory-scene { position:relative; height:140px; overflow:hidden; background:#587e8f; border-radius:4px; margin-bottom:12px; }
 .office-memory-scene .office-object { transform:scale(.65); }
@@ -4777,6 +5682,12 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .is-arranging .office-furniture { outline:1px dashed #ffefd3; outline-offset:5px; cursor:move; }
 .office-floor-plaque { position:absolute; bottom:13px; left:50%; transform:translateX(-50%); color:#fff8e8; opacity:.8; font-size:10px; white-space:nowrap; }
 .office-object { width:42px; height:42px; position:relative; display:inline-block; filter:drop-shadow(0 4px 2px #16232d50); }
+.office-object.is-image { width:42px; height:42px; margin:0; background:none; border:0; border-radius:0; transform:none; }
+.office-object.is-image > img { display:block; width:100%; height:100%; object-fit:contain; pointer-events:none; }
+.office-furniture[data-office-prop=coffee] .office-object.is-image { transform:translateY(-10px); }
+.office-desk-top.has-art { background:none; box-shadow:none; outline:0; border-radius:0; }
+.office-desk-top.has-art:before, .office-desk-top.has-art:after { display:none; }
+.office-desk-art { position:absolute; left:0; top:0; width:100%; height:68px; pointer-events:none; filter:drop-shadow(0 10px 6px rgba(0,0,0,.3)); }
 .art-mug { width:25px; height:25px; margin-top:15px; background:#e9d5ae; border-radius:2px 2px 8px 8px; border-top:3px solid #70492f; }
 .art-mug i { right:-8px; top:2px; width:12px; height:14px; border:4px solid #e9d5ae; border-radius:5px; }
 .art-parcel { width:25px; height:20px; background:#c9a16c; border-top:5px solid #dfbc8c; border-bottom:3px solid #9d7547; border-radius:2px; }
@@ -4823,10 +5734,15 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .office-keepsakes .art-mug { margin-right:-13px; }
 .office-root[data-office-hidden=true] * { animation-play-state:paused !important; }
 .office-banter { position:absolute; bottom:calc(100% + 10px); left:50%; transform:translateX(-50%) rotate(-2deg); max-width:150px; min-width:95px; background:#fff7df; color:#423622; border-radius:7px 7px 7px 0; box-shadow:0 3px 7px #18252d30; padding:7px 9px; font-size:11px; line-height:1.35; z-index:10; pointer-events:none; }
+.office-person:has(.office-face.is-sprite) .office-whisper { top:-70px; }
+.office-person:has(.office-face.is-sprite) .office-banter { bottom:calc(100% + 70px); }
 .quirk-quiet.is-cheers .office-face { animation:none; transform:rotate(-5deg); }
 .quirk-champion.is-cheers .office-face { animation:office-victory .6s ease-in-out infinite; }
+.quirk-champion.is-cheers .office-face.is-sprite { animation:office-victory-sprite .6s ease-in-out infinite; }
 .quirk-tidy.is-wander .office-face { transform:rotate(0); }
+.quirk-tidy.is-wander .office-face.is-sprite { transform:scale(2.73) rotate(0); }
 .quirk-curious.is-wander .office-face { transform:rotate(7deg); }
+.quirk-curious.is-wander .office-face.is-sprite { transform:scale(2.73) rotate(7deg); }
 .office-incident-art { position:absolute; left:40%; top:58%; width:160px; height:80px; }
 .office-visiting-object { display:block; position:absolute; width:36px; height:36px; animation:office-toy-travel 4s ease-in-out infinite alternate; }
 .incident-ball .office-visiting-object { border-radius:50%; background:conic-gradient(#e5bc60 0 90deg,#e8e4ca 90deg 180deg,#ba6345 180deg 270deg,#5b9294 270deg); box-shadow:0 4px 7px #172b3440; }
@@ -4840,16 +5756,21 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 .incident-printer.phase-1 .art-chair,.incident-mouse.phase-1 .art-cat { animation:office-toy-travel 3s ease-in-out infinite alternate; }
 .incident-ball.phase-1 .art-fan b,.incident-printer.phase-1 .art-fan b { animation-duration:.25s; }
 .office-room[data-incident=gravity] .office-person:not(.is-think) .office-face,.incident-gravity .office-object { animation:office-zero-g 4s ease-in-out infinite alternate; }
+.office-room[data-incident=gravity] .office-person:not(.is-think) .office-face.is-sprite { animation:office-zero-g-sprite 4s ease-in-out infinite alternate; }
 .office-room[data-incident=ice] .office-wander-layer .office-person:not(.is-think) .office-face,.incident-ice .art-chair { animation:office-skate 3s ease-in-out infinite alternate; }
+.office-room[data-incident=ice] .office-wander-layer .office-person:not(.is-think) .office-face.is-sprite { animation:office-skate-sprite 3s ease-in-out infinite alternate; }
 .office-room[data-incident=ufo] .office-eom { animation:office-zero-g 4s ease-in-out infinite alternate; }
 @keyframes office-fan-spin { to { transform:rotate(360deg); } }
 @keyframes office-fish { to { transform:translateX(15px); } }
 @keyframes office-victory { 50% { transform:translateY(-12px) rotate(12deg); } }
+@keyframes office-victory-sprite { 50% { translate:0 -12px; rotate:12deg; } }
 @keyframes office-toy-travel { from { transform:translate(-65px,20px) rotate(-15deg); } to { transform:translate(100px,-25px) rotate(20deg); } }
 @keyframes office-paper-storm { from { transform:translate(0,0) rotate(-20deg); opacity:1; } to { transform:translate(calc(var(--n) * 35px - 70px),-90px) rotate(100deg); opacity:0; } }
 @keyframes office-plant-arrives { from { transform:scale(.4); } to { transform:scale(1.5) translateY(-20px); } }
 @keyframes office-zero-g { to { transform:translateY(-28px) rotate(12deg); } }
+@keyframes office-zero-g-sprite { to { translate:0 -28px; rotate:12deg; } }
 @keyframes office-skate { to { transform:translateX(25px) rotate(-15deg); } }
+@keyframes office-skate-sprite { to { translate:25px 0; rotate:-15deg; } }
 @media (max-width:700px) { .office-header { padding:12px; gap:8px; } .office-room { margin:0 8px; } .office-title { font-size:20px; } .office-life-caption { display:none; } .office-life-toolbar { padding:8px 12px; } .office-chaos { width:100%; } .office-life-panel { right:8px; padding:16px; width:calc(100vw - 52px); } .office-recap { display:none; } }
 @media (prefers-reduced-motion:reduce) { .office-life-scene *, .office-keepsakes *, .office-memory-scene *, .office-room[data-incident] .office-face, .office-room[data-incident] .office-eom, .quirk-champion.is-cheers .office-face { animation:none !important; transition:none !important; } }
 `
@@ -4888,10 +5809,18 @@ const plugin = {
       $hint.set(hintStage === 'wait' || hintStage === 'play' || hintStage === 'done' ? hintStage : 'task')
       const news = ctx.storage?.get?.('news', null)
       if (news && typeof news === 'object' && !Array.isArray(news)) $news.set(news)
+      $logbook.set(normalizeLogbook(ctx.storage?.get?.('logbook', null)))
       const ritualHour = ctx.storage?.get?.('ritualHour', null)
       if (typeof ritualHour === 'number') $ritual.set({ hour: ritualHour, at: 0 })
       const trophies = ctx.storage?.get?.('trophies', null)
       if (trophies && typeof trophies === 'object' && !Array.isArray(trophies)) $trophies.set(trophies)
+      const spriteMode = ctx.storage?.get?.('spriteMode', null)
+      if (SPRITE_MODES.includes(spriteMode)) $spriteMode.set(spriteMode)
+      const spriteBackground = ctx.storage?.get?.('spriteWorld', null)
+      if (typeof spriteBackground === 'string') $spriteWorld.set(spriteBackground)
+      const assign = ctx.storage?.get?.('spriteAssign', null)
+      if (assign && typeof assign === 'object' && !Array.isArray(assign)) $spriteAssign.set(assign)
+      void loadSpriteConfig()
       $backdrop.set('carpet')
       $officeLife.set(normalizeOfficeLife(ctx.storage?.get?.('officeLife', null)))
       const jobs = normalizeJobs(ctx.storage?.get?.(JOBS_STORAGE_KEY, null))

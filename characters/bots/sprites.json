@@ -1,0 +1,39 @@
+{
+  "_comment": "One character set. Put <color>_<mood>.gif files next to this file; every color found becomes selectable in the Sprites panel. 'colors' only adds a label and swatch (the agent's accent color) and may list explicit 'files' per mood. 'aliases' lists the file suffixes a mood accepts (first wins). 'fallback' lets a missing mood reuse another one. 'default' is used for moods a color has no file for. 'suggest' is only the initial color for agents that have no saved choice. Moods: idle, think, held, sleep, pet, clap, stretch, shy, peek, bored, failed, walkfront, walkback.",
+  "name": "Bots",
+  "colors": {
+    "cyan": { "label": "Cyan", "swatch": "#06b6d4" },
+    "blue": { "label": "Blue", "swatch": "#3b82f6" },
+    "orange": { "label": "Orange", "swatch": "#f97316" },
+    "yellow": { "label": "Yellow", "swatch": "#eab308" },
+    "purple": { "label": "Purple", "swatch": "#7c3aed" },
+    "green": { "label": "Green", "swatch": "#10b981" },
+    "pink": { "label": "Pink", "swatch": "#ec4899" }
+  },
+  "aliases": {
+    "think": ["think", "thinking"],
+    "peek": ["peek", "working"],
+    "clap": ["clap", "success"],
+    "pet": ["pet", "success"],
+    "held": ["held", "alert"],
+    "failed": ["failed", "alert"],
+    "walkfront": ["walkfront", "move_front"],
+    "walkback": ["walkback", "move_back"]
+  },
+  "fallback": {
+    "shy": "think"
+  },
+  "default": {
+    "idle": "bot-default.gif"
+  },
+  "suggest": {
+    "default": "cyan",
+    "hermy": "cyan",
+    "manager": "blue",
+    "sysadmin": "orange",
+    "analyst": "yellow",
+    "coder": "purple",
+    "webmaster": "green",
+    "quality": "pink"
+  }
+}

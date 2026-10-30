@@ -3,5 +3,6 @@
   "version": "0.1.0.post1",
   "description": "View and manage Bot Mode agents in a shared office in Hermes Desktop.",
   "updater": "none",
-  "companions": []
+  "companions": [],
+  "assets": ["world", "characters"]
 }
